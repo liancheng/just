@@ -15,12 +15,12 @@ import sys
 import unittest
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Callable, cast
+from typing import Callable, Type, TypeVar, cast
 
 import lsprotocol.types as L
 import tree_sitter as T
 import typer
-from pygls.server import LanguageServer
+from pygls.lsp.server import LanguageServer
 from tree_sitter_language_pack import get_language, get_parser
 
 app = typer.Typer(
@@ -33,6 +33,8 @@ logging.basicConfig(
     filemode="w",
     level=logging.DEBUG,
 )
+
+ExprType = TypeVar("ExprType")
 
 
 @dataclass
@@ -51,6 +53,14 @@ class Expr:
         }
 
         return dispatch[node.type](node)
+
+    def to(self, expect_type: Type[ExprType]) -> ExprType:
+        if not isinstance(self, expect_type):
+            raise TypeError(
+                f"Expected {expect_type.__name__}, got {type(self).__name__}"
+            )
+
+        return cast(ExprType, self)
 
 
 @dataclass
@@ -140,10 +150,10 @@ class Bind:
         [id, value] = node.named_children
         return Bind(
             range=L.Range(
-                to_lsp_position(id.range.start_point),
-                to_lsp_position(value.range.end_point),
+                lsp_position_of(id.range.start_point),
+                lsp_position_of(value.range.end_point),
             ),
-            id=cast(Id, Expr.from_tree(id)),
+            id=Expr.from_tree(id).to(Id),
             value=Expr.from_tree(value),
         )
 
@@ -163,14 +173,14 @@ class Local(Expr):
         )
 
 
-def to_lsp_position(point: T.Point) -> L.Position:
+def lsp_position_of(point: T.Point) -> L.Position:
     return L.Position(point.row, point.column)
 
 
 def lsp_range_of(node: T.Node) -> L.Range:
     return L.Range(
-        to_lsp_position(node.range.start_point),
-        to_lsp_position(node.range.end_point),
+        lsp_position_of(node.range.start_point),
+        lsp_position_of(node.range.end_point),
     )
 
 
@@ -182,7 +192,7 @@ def parse(source: str) -> T.Node:
 
 
 def document_root(uri: str) -> T.Node:
-    return parse(server.workspace.get_document(uri).source)
+    return parse(server.workspace.get_text_document(uri).source)
 
 
 @server.feature(L.TEXT_DOCUMENT_COMPLETION)
@@ -237,8 +247,40 @@ class PositionDSL(L.Position):
     def length(self, n: int) -> L.Range:
         return L.Range(self, L.Position(self.line, self.character + n))
 
-    def end_at(self, end_line: int, end_character: int) -> L.Range:
-        return L.Range(self, L.Position(end_line, end_character))
+    def to(self, end: L.Position) -> L.Range:
+        return L.Range(self, end)
+
+
+class TestDocument:
+    def __init__(self, source: str) -> None:
+        self.lines = source.splitlines(keepends=False)
+        self.root_node = parse(source)
+        self.document = Document.from_tree(self.root_node)
+        self.full_range = lsp_range_of(self.root_node)
+
+    def start_of(self, needle: str, line=1, occurrence=1) -> PositionDSL:
+        assert line >= 1 and occurrence >= 1
+
+        line -= 1
+        occurrence -= 1
+        character = self.lines[line].find(needle)
+
+        while occurrence > 0:
+            occurrence -= 1
+            character = self.lines[line].find(needle, character + len(needle))
+
+        return PositionDSL(line, character)
+
+    def end_of(self, needle: str, line=1, occurrence=1) -> PositionDSL:
+        pos = self.start_of(needle, line, occurrence)
+        pos.character += len(needle)
+        return pos
+
+    def range_of(self, needle: str, line=1, occurrence=1) -> L.Range:
+        return L.Range(
+            self.start_of(needle, line, occurrence),
+            self.end_of(needle, line, occurrence),
+        )
 
 
 def start_at(line: int, character: int) -> PositionDSL:
@@ -247,31 +289,53 @@ def start_at(line: int, character: int) -> PositionDSL:
 
 class TestAST(unittest.TestCase):
     def test_parse_number(self):
+        t = TestDocument("1")
+
         self.assertEqual(
-            Expr.from_tree(parse("1")),
-            Document(
-                range=start_at(0, 0).length(1),
-                body=Number(
-                    range=start_at(0, 0).length(1),
-                    value=1,
-                ),
+            t.document.body,
+            Number(range=t.full_range, value=1),
+        )
+
+    def test_parse_local(self):
+        t = TestDocument("local x = 1; x")
+
+        self.assertEqual(
+            t.document.body,
+            Local(
+                range=t.full_range,
+                binds=[
+                    Bind(
+                        range=t.start_of("x").to(t.end_of("1")),
+                        id=Id(t.range_of("x"), name="x"),
+                        value=Number(t.start_of("1").length(1), value=1),
+                    ),
+                ],
+                body=Id(t.range_of("x", occurrence=2), name="x"),
+            ),
+        )
+
+    def test_parse_empty_array(self):
+        t = TestDocument("[]")
+
+        self.assertEqual(
+            t.document.body,
+            Array(
+                range=t.full_range,
+                values=[],
             ),
         )
 
     def test_parse_array(self):
+        t = TestDocument("[1, 2]")
+
         self.assertEqual(
-            Expr.from_tree(parse("[1]")),
-            Document(
-                range=start_at(0, 0).length(3),
-                body=Array(
-                    start_at(0, 0).length(3),
-                    [
-                        Number(
-                            range=start_at(0, 1).length(1),
-                            value=1,
-                        ),
-                    ],
-                ),
+            t.document.body,
+            Array(
+                range=t.full_range,
+                values=[
+                    Number(range=t.range_of("1"), value=1),
+                    Number(range=t.range_of("2"), value=2),
+                ],
             ),
         )
 
