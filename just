@@ -11,7 +11,6 @@
 # ///
 
 import logging
-import sys
 import unittest
 from dataclasses import dataclass
 from enum import StrEnum
@@ -112,7 +111,7 @@ class Number(Expr):
 
 @dataclass
 class Str(Expr):
-    value: str
+    raw: str
 
     @staticmethod
     def from_tree(node: T.Node) -> "Str":
@@ -123,7 +122,8 @@ class Str(Expr):
 
         return Str(
             range=lsp_range_of(node),
-            value=content.text.decode(),
+            # The raw string content before escaping or indentations are handled.
+            raw=content.text.decode(),
         )
 
 
@@ -311,12 +311,41 @@ def completions(params: L.CompletionParams):
     )
 
 
-class PositionDSL(L.Position):
-    def length(self, n: int) -> L.Range:
-        return L.Range(self, L.Position(self.line, self.character + n))
+@dataclass
+class ExprBuilder:
+    range: L.Range
 
-    def to(self, end: L.Position) -> L.Range:
-        return L.Range(self, end)
+    def id(self, name: str) -> Id:
+        return Id(self.range, name)
+
+    def num(self, value: float) -> Number:
+        return Number(self.range, value)
+
+    def str(self, raw: str) -> Str:
+        return Str(self.range, raw)
+
+    def boolean(self, value: bool) -> Bool:
+        return Bool(self.range, value)
+
+    def arr(self, values: list[Expr]) -> Array:
+        return Array(self.range, values)
+
+    def bin_op(self, op: Operator | str, lhs: Expr, rhs: Expr) -> Binary:
+        return Binary(self.range, Operator(op) if isinstance(op, str) else op, lhs, rhs)
+
+    def bind(self, id: Id, value: Expr) -> Bind:
+        return Bind(self.range, id, value)
+
+    def local(self, binds: list[Bind], body: Expr) -> Local:
+        return Local(self.range, binds, body)
+
+
+def at(range: L.Range) -> ExprBuilder:
+    return ExprBuilder(range)
+
+
+def span(start: L.Position, end: L.Position) -> ExprBuilder:
+    return at(L.Range(start, end))
 
 
 class TestDocument:
@@ -324,9 +353,9 @@ class TestDocument:
         self.lines = source.splitlines(keepends=False)
         self.root_node = parse(source)
         self.document = Document.from_tree(self.root_node)
-        self.full_range = lsp_range_of(self.root_node)
+        self.body_range = self.document.body.range
 
-    def start_of(self, needle: str, line=1, occurrence=1) -> PositionDSL:
+    def start_of(self, needle: str, line=1, occurrence=1) -> L.Position:
         assert line >= 1 and occurrence >= 1
 
         line -= 1
@@ -340,22 +369,17 @@ class TestDocument:
             character = self.lines[line].find(needle, character + len(needle))
             assert character >= 0
 
-        return PositionDSL(line, character)
+        return L.Position(line, character)
 
-    def end_of(self, needle: str, line=1, occurrence=1) -> PositionDSL:
+    def end_of(self, needle: str, line=1, occurrence=1) -> L.Position:
         pos = self.start_of(needle, line, occurrence)
         pos.character += len(needle)
         return pos
 
     def range_of(self, needle: str, line=1, occurrence=1) -> L.Range:
-        return L.Range(
-            self.start_of(needle, line, occurrence),
-            self.end_of(needle, line, occurrence),
-        )
-
-
-def start_at(line: int, character: int) -> PositionDSL:
-    return PositionDSL(line, character)
+        start = self.start_of(needle, line, occurrence)
+        end = L.Position(start.line, start.character + len(needle))
+        return L.Range(start, end)
 
 
 class TestAST(unittest.TestCase):
@@ -364,60 +388,36 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             t.document.body,
-            Number(range=t.full_range, value=1),
+            at(t.body_range).num(1),
         )
 
-    def test_single_quoted_string(self):
-        t = TestDocument("'hello'")
-
-        self.assertEqual(
-            t.document.body,
-            Str(range=t.full_range, value="hello"),
-        )
-
-    def test_double_quoted_string(self):
-        t = TestDocument('"hello"')
-
-        self.assertEqual(
-            t.document.body,
-            Str(range=t.full_range, value="hello"),
-        )
-
-    def test_verbatim_string(self):
-        t = TestDocument(
-            dedent(
-                """\
-                |||
-                    hello
-                |||
-                """
+    def test_string(self):
+        for input, expected in [
+            ("'hello\\nworld'", "hello\\nworld"),
+            ('"hello\\nworld"', "hello\\nworld"),
+            ("@'hello\\nworld'", "hello\\nworld"),
+            ('@"hello\\nworld"', "hello\\nworld"),
+            ("|||\n  hello\n|||", "\n  hello\n"),
+        ]:
+            t = TestDocument(input)
+            self.assertEqual(
+                t.document.body,
+                at(t.body_range).str(expected),
             )
-        )
-
-        # Seems that the Jsonnet tree-sitter grammar does NOT handle indentations.
-        self.assertEqual(
-            t.document.body,
-            Str(
-                range=t.start_of("|||").to(t.end_of("|||", line=3)),
-                value="\n    hello\n",
-            ),
-        )
 
     def test_local(self):
         t = TestDocument("local x = 1; x")
 
         self.assertEqual(
             t.document.body,
-            Local(
-                range=t.full_range,
+            at(t.body_range).local(
                 binds=[
-                    Bind(
-                        range=t.start_of("x").to(t.end_of("1")),
-                        id=Id(t.range_of("x"), name="x"),
-                        value=Number(t.range_of("1"), value=1),
+                    at(t.range_of("x = 1")).bind(
+                        at(t.range_of("x")).id("x"),
+                        at(t.range_of("1")).num(1),
                     ),
                 ],
-                body=Id(t.range_of("x", occurrence=2), name="x"),
+                body=at(t.range_of("x", occurrence=2)).id("x"),
             ),
         )
 
@@ -431,31 +431,24 @@ class TestAST(unittest.TestCase):
             )
         )
 
-        local = t.document.body.to(Local)
-
         self.assertEqual(
-            local.binds,
-            [
-                Bind(
-                    range=t.start_of("x").to(t.end_of("1")),
-                    id=Id(range=t.range_of("x"), name="x"),
-                    value=Number(range=t.range_of("1"), value=1.0),
+            t.document.body,
+            at(t.body_range).local(
+                binds=[
+                    at(t.range_of("x = 1")).bind(
+                        at(t.range_of("x")).id("x"),
+                        at(t.range_of("1")).num(1),
+                    ),
+                    at(t.range_of("y = 2")).bind(
+                        at(t.range_of("y")).id("y"),
+                        at(t.range_of("2")).num(2),
+                    ),
+                ],
+                body=at(t.range_of("x + y", line=2)).bin_op(
+                    "+",
+                    at(t.range_of("x", line=2)).id("x"),
+                    at(t.range_of("y", line=2)).id("y"),
                 ),
-                Bind(
-                    range=t.start_of("y").to(t.end_of("2")),
-                    id=Id(range=t.range_of("y"), name="y"),
-                    value=Number(range=t.range_of("2"), value=2.0),
-                ),
-            ],
-        )
-
-        self.assertEqual(
-            local.body,
-            Binary(
-                range=t.range_of("x + y", line=2),
-                op=Operator.Plus,
-                lhs=Id(range=t.range_of("x", line=2), name="x"),
-                rhs=Id(range=t.range_of("y", line=2), name="y"),
             ),
         )
 
@@ -464,10 +457,7 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             t.document.body,
-            Array(
-                range=t.full_range,
-                values=[],
-            ),
+            at(t.body_range).arr([]),
         )
 
     def test_array(self):
@@ -475,12 +465,11 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             t.document.body,
-            Array(
-                range=t.full_range,
-                values=[
-                    Number(range=t.range_of("1"), value=1.0),
-                    Bool(range=t.range_of("true"), value=True),
-                    Str(range=t.range_of("'3'"), value="3"),
+            at(t.body_range).arr(
+                [
+                    at(t.range_of("1")).num(1),
+                    at(t.range_of("true")).boolean(True),
+                    at(t.range_of("'3'")).str("3"),
                 ],
             ),
         )
@@ -491,11 +480,10 @@ class TestAST(unittest.TestCase):
 
             self.assertEqual(
                 t.document.body,
-                Binary(
-                    range=t.full_range,
-                    op=op,
-                    lhs=Id(range=t.range_of("a"), name="a"),
-                    rhs=Id(range=t.range_of("b"), name="b"),
+                at(t.body_range).bin_op(
+                    op,
+                    at(t.range_of("a")).id("a"),
+                    at(t.range_of("b")).id("b"),
                 ),
             )
 
@@ -504,15 +492,13 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             t.document.body,
-            Binary(
-                range=t.full_range,
-                op=Operator.Plus,
-                lhs=Id(range=t.range_of("a"), name="a"),
-                rhs=Binary(
-                    range=t.range_of("b * c"),
-                    op=Operator.Multiply,
-                    lhs=Id(range=t.range_of("b"), name="b"),
-                    rhs=Id(range=t.range_of("c"), name="c"),
+            at(t.body_range).bin_op(
+                "+",
+                at(t.range_of("a")).id("a"),
+                at(t.range_of("b * c")).bin_op(
+                    "*",
+                    at(t.range_of("b")).id("b"),
+                    at(t.range_of("c")).id("c"),
                 ),
             ),
         )
@@ -525,7 +511,7 @@ def serve():
 
 @app.command()
 def test():
-    unittest.main(argv=sys.argv[1:])
+    unittest.main(argv=["--verbose", "--locals"])
 
 
 if __name__ == "__main__":
