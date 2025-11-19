@@ -66,6 +66,40 @@ class Expr:
 
         return cast(ExprType, self)
 
+    def bin_op(self, op: "Operator", rhs: "Expr") -> "Binary":
+        range = L.Range(self.range.start, rhs.range.end)
+        return Binary(range, op, self, rhs)
+
+    def __add__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Plus, rhs)
+
+    def __sub__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Minus, rhs)
+
+    def __mul__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Multiply, rhs)
+
+    def __truediv__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Divide, rhs)
+
+    def __lt__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.LT, rhs)
+
+    def __le__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.LE, rhs)
+
+    def __gt__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.GT, rhs)
+
+    def __ge__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.GE, rhs)
+
+    def __eq__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Eq, rhs)
+
+    def __ne__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.NotEq, rhs)
+
 
 @dataclass
 class Document(Expr):
@@ -405,10 +439,21 @@ class ExprBuilder:
     def list_comp(
         self,
         expr: Expr,
-        for_spec: ForSpec,
-        comp_spec: list[ForSpec | IfSpec] = [],
+        specs: list[ForSpec | IfSpec] = [],
     ) -> ListComp:
-        return ListComp(self.range, expr, for_spec, comp_spec)
+        match specs:
+            case [ForSpec() as for_spec, *comp_spec]:
+                return ListComp(self.range, expr, for_spec, comp_spec)
+
+            case []:
+                raise RuntimeError(
+                    "A list comprehension must have at least 1 for-spec."
+                )
+
+            case _:
+                raise RuntimeError(
+                    "The first spec of a list comprehension must be a for-spec."
+                )
 
     def for_spec(self, id: Id, expr: Expr) -> ForSpec:
         return ForSpec(self.range, id, expr)
@@ -489,11 +534,11 @@ class TestAST(unittest.TestCase):
             at(t.body_range).local(
                 binds=[
                     at(t.range_of("x = 1")).bind(
-                        at(t.range_of("x")).id("x"),
+                        t.id("x"),
                         at(t.range_of("1")).num(1),
                     ),
                 ],
-                body=at(t.range_of("x", occurrence=2)).id("x"),
+                body=t.id("x", occurrence=2),
             ),
         )
 
@@ -512,19 +557,15 @@ class TestAST(unittest.TestCase):
             at(t.body_range).local(
                 binds=[
                     at(t.range_of("x = 1")).bind(
-                        at(t.range_of("x")).id("x"),
+                        t.id("x"),
                         at(t.range_of("1")).num(1),
                     ),
                     at(t.range_of("y = 2")).bind(
-                        at(t.range_of("y")).id("y"),
+                        t.id("y"),
                         at(t.range_of("2")).num(2),
                     ),
                 ],
-                body=at(t.range_of("x + y", line=2)).bin_op(
-                    "+",
-                    at(t.range_of("x", line=2)).id("x"),
-                    at(t.range_of("y", line=2)).id("y"),
-                ),
+                body=t.id("x", line=2) + t.id("y", line=2),
             ),
         )
 
@@ -556,11 +597,7 @@ class TestAST(unittest.TestCase):
 
             self.assertEqual(
                 t.document.body,
-                at(t.body_range).bin_op(
-                    op,
-                    t.id("a"),
-                    t.id("b"),
-                ),
+                t.id("a").bin_op(op, t.id("b")),
             )
 
     def test_binary_precedences(self):
@@ -568,15 +605,7 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             t.document.body,
-            at(t.body_range).bin_op(
-                "+",
-                t.id("a"),
-                at(t.range_of("b * c")).bin_op(
-                    "*",
-                    t.id("b"),
-                    t.id("c"),
-                ),
-            ),
+            t.id("a") + t.id("b") * t.id("c"),
         )
 
     def test_list_comp(self):
@@ -586,23 +615,20 @@ class TestAST(unittest.TestCase):
             t.document.body,
             at(t.body_range).list_comp(
                 expr=t.id("x"),
-                for_spec=at(t.range_of("for x in [1, 2]")).for_spec(
-                    id=at(t.range_of("x", occurrence=2)).id("x"),
-                    expr=at(t.range_of("[1, 2]")).arr(
-                        [
-                            at(t.range_of("1")).num(1),
-                            at(t.range_of("2")).num(2),
-                        ]
+                specs=[
+                    at(t.range_of("for x in [1, 2]")).for_spec(
+                        id=t.id("x", occurrence=2),
+                        expr=at(t.range_of("[1, 2]")).arr(
+                            [
+                                at(t.range_of("1")).num(1.0),
+                                at(t.range_of("2")).num(2.0),
+                            ]
+                        ),
                     ),
-                ),
-                comp_spec=[
                     at(t.range_of("if x > 1")).if_spec(
-                        at(t.range_of("x > 1")).bin_op(
-                            ">",
-                            t.id("x", occurrence=3),
-                            at(t.range_of("1", occurrence=2)).num(1),
-                        )
-                    )
+                        t.id("x", occurrence=3)
+                        > at(t.range_of("1", occurrence=2)).num(1.0),
+                    ),
                 ],
             ),
         )
