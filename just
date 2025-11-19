@@ -14,6 +14,7 @@ import logging
 import sys
 import unittest
 from dataclasses import dataclass
+from enum import StrEnum
 from textwrap import dedent
 from typing import Callable, Type, TypeVar, cast
 
@@ -45,14 +46,14 @@ class Expr:
     def from_tree(node: T.Node) -> "Expr":
         dispatch: dict[str, Callable[[T.Node], "Expr"]] = {
             "array": Array.from_tree,
+            "binary": Binary.from_tree,
             "document": Document.from_tree,
+            "false": Bool.from_tree,
             "id": Id.from_tree,
             "local_bind": Local.from_tree,
             "number": Number.from_tree,
-            "string_content": Str.from_tree,
             "string": Str.from_tree,
             "true": Bool.from_tree,
-            "false": Bool.from_tree,
         }
 
         return dispatch[node.type](node)
@@ -60,7 +61,7 @@ class Expr:
     def to(self, expect_type: Type[ExprType]) -> ExprType:
         if not isinstance(self, expect_type):
             raise TypeError(
-                f"Expected {expect_type.__name__}, got {type(self).__name__}"
+                f"Expected {expect_type.__name__}, but got {type(self).__name__}"
             )
 
         return cast(ExprType, self)
@@ -72,6 +73,7 @@ class Document(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Document":
+        assert node.type == "document"
         return Document(
             range=lsp_range_of(node),
             body=Expr.from_tree(node.named_children[0]),
@@ -84,7 +86,9 @@ class Id(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Id":
+        assert node.type == "id"
         assert node.text is not None
+
         return Id(
             range=lsp_range_of(node),
             name=node.text.decode(),
@@ -97,7 +101,9 @@ class Number(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Number":
+        assert node.type == "number"
         assert node.text is not None
+
         return Number(
             range=lsp_range_of(node),
             value=float(node.text.decode()),
@@ -110,8 +116,11 @@ class Str(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Str":
+        assert node.type == "string"
+
         _, content, _ = node.named_children
         assert content.text is not None
+
         return Str(
             range=lsp_range_of(node),
             value=content.text.decode(),
@@ -124,7 +133,9 @@ class Bool(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Bool":
+        assert node.type in ["true", "false"]
         assert node.text is not None
+
         return Bool(
             range=lsp_range_of(node),
             value=node.text.decode() == "true",
@@ -137,9 +148,58 @@ class Array(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Array":
+        assert node.type == "array"
         return Array(
             range=lsp_range_of(node),
             values=[Expr.from_tree(c) for c in node.named_children],
+        )
+
+
+class Operator(StrEnum):
+    Multiply = "*"
+    Divide = "/"
+    Modulus = "%"
+
+    Plus = "+"
+    Minus = "-"
+
+    ShiftLeft = "<<"
+    ShiftRight = ">>"
+
+    LT = "<"
+    LE = "<="
+    GT = ">"
+    GE = ">="
+    In = "in"
+
+    Eq = "=="
+    NotEq = "!="
+
+    BitAnd = "&"
+    BitXor = "^"
+    BitOr = "|"
+    And = "&&"
+    Or = "||"
+
+
+@dataclass
+class Binary(Expr):
+    op: Operator
+    lhs: Expr
+    rhs: Expr
+
+    @staticmethod
+    def from_tree(node: T.Node) -> "Binary":
+        assert node.type == "binary"
+
+        lhs, op, rhs = node.named_children
+        assert op.text is not None
+
+        return Binary(
+            range=lsp_range_of(node),
+            op=Operator(op.text.decode("utf-8")),
+            lhs=Expr.from_tree(lhs),
+            rhs=Expr.from_tree(rhs),
         )
 
 
@@ -151,7 +211,9 @@ class Bind:
 
     @staticmethod
     def from_tree(node: T.Node) -> "Bind":
+        assert node.type == "bind"
         [id, value] = node.named_children
+
         return Bind(
             range=L.Range(
                 lsp_position_of(id.range.start_point),
@@ -169,7 +231,9 @@ class Local(Expr):
 
     @staticmethod
     def from_tree(node: T.Node) -> "Local":
+        assert node.type == "local_bind"
         _, *binds, expr = node.named_children
+
         return Local(
             range=lsp_range_of(node),
             binds=[Bind.from_tree(b) for b in binds],
@@ -295,7 +359,7 @@ def start_at(line: int, character: int) -> PositionDSL:
 
 
 class TestAST(unittest.TestCase):
-    def test_parse_number(self):
+    def test_number(self):
         t = TestDocument("1")
 
         self.assertEqual(
@@ -303,7 +367,7 @@ class TestAST(unittest.TestCase):
             Number(range=t.full_range, value=1),
         )
 
-    def test_parse_single_quoted_string(self):
+    def test_single_quoted_string(self):
         t = TestDocument("'hello'")
 
         self.assertEqual(
@@ -311,7 +375,7 @@ class TestAST(unittest.TestCase):
             Str(range=t.full_range, value="hello"),
         )
 
-    def test_parse_double_quoted_string(self):
+    def test_double_quoted_string(self):
         t = TestDocument('"hello"')
 
         self.assertEqual(
@@ -319,7 +383,7 @@ class TestAST(unittest.TestCase):
             Str(range=t.full_range, value="hello"),
         )
 
-    def test_parse_verbatim_string(self):
+    def test_verbatim_string(self):
         t = TestDocument(
             dedent(
                 """\
@@ -339,7 +403,7 @@ class TestAST(unittest.TestCase):
             ),
         )
 
-    def test_parse_local(self):
+    def test_local(self):
         t = TestDocument("local x = 1; x")
 
         self.assertEqual(
@@ -357,12 +421,12 @@ class TestAST(unittest.TestCase):
             ),
         )
 
-    def test_parse_local_multi_binds(self):
+    def test_local_multi_binds(self):
         t = TestDocument(
             dedent(
                 """\
                 local x = 1, y = 2;
-                [x, y]
+                x + y
                 """
             )
         )
@@ -387,16 +451,15 @@ class TestAST(unittest.TestCase):
 
         self.assertEqual(
             local.body,
-            Array(
-                range=t.range_of("[x, y]", line=2),
-                values=[
-                    Id(range=t.range_of("x", line=2), name="x"),
-                    Id(range=t.range_of("y", line=2), name="y"),
-                ],
+            Binary(
+                range=t.range_of("x + y", line=2),
+                op=Operator.Plus,
+                lhs=Id(range=t.range_of("x", line=2), name="x"),
+                rhs=Id(range=t.range_of("y", line=2), name="y"),
             ),
         )
 
-    def test_parse_empty_array(self):
+    def test_empty_array(self):
         t = TestDocument("[]")
 
         self.assertEqual(
@@ -407,7 +470,7 @@ class TestAST(unittest.TestCase):
             ),
         )
 
-    def test_parse_array(self):
+    def test_array(self):
         t = TestDocument("[1, true, '3']")
 
         self.assertEqual(
@@ -419,6 +482,38 @@ class TestAST(unittest.TestCase):
                     Bool(range=t.range_of("true"), value=True),
                     Str(range=t.range_of("'3'"), value="3"),
                 ],
+            ),
+        )
+
+    def test_binary(self):
+        for op in Operator:
+            t = TestDocument(f"a {op.value} b")
+
+            self.assertEqual(
+                t.document.body,
+                Binary(
+                    range=t.full_range,
+                    op=op,
+                    lhs=Id(range=t.range_of("a"), name="a"),
+                    rhs=Id(range=t.range_of("b"), name="b"),
+                ),
+            )
+
+    def test_binary_precedences(self):
+        t = TestDocument("a + b * c")
+
+        self.assertEqual(
+            t.document.body,
+            Binary(
+                range=t.full_range,
+                op=Operator.Plus,
+                lhs=Id(range=t.range_of("a"), name="a"),
+                rhs=Binary(
+                    range=t.range_of("b * c"),
+                    op=Operator.Multiply,
+                    lhs=Id(range=t.range_of("b"), name="b"),
+                    rhs=Id(range=t.range_of("c"), name="c"),
+                ),
             ),
         )
 
