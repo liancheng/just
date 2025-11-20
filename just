@@ -50,6 +50,7 @@ class Expr:
             "document": Document.from_tree,
             "false": Bool.from_tree,
             "forloop": ListComp.from_tree,
+            "functioncall": Call.from_tree,
             "id": Id.from_tree,
             "local_bind": Local.from_tree,
             "number": Num.from_tree,
@@ -254,29 +255,24 @@ class Bind:
         assert node.type == "bind"
         assert 2 <= len(node.named_children) <= 3
 
+        id, *maybe_params, body_or_value = node.named_children
+
         range = range_of(node)
+        value = (
+            Fn(
+                range=range,
+                params=[
+                    Param.from_tree(param)
+                    for params in maybe_params
+                    for param in params.named_children
+                ],
+                body=Expr.from_tree(body_or_value),
+            )
+            if node.field_name_for_child(0) == "function"
+            else Expr.from_tree(body_or_value)
+        )
 
-        [id, *maybe_params, body] = node.named_children
-        params = [param for params in maybe_params for param in params.named_children]
-
-        match id, params, body:
-            case _ if node.field_name_for_child(0) == "function":
-                return Bind(
-                    range=range,
-                    id=Id.from_tree(id),
-                    value=Fn(
-                        range=range,
-                        params=[Param.from_tree(param) for param in params],
-                        body=Expr.from_tree(body),
-                    ),
-                )
-
-            case _:
-                return Bind(
-                    range=range,
-                    id=Id.from_tree(id),
-                    value=Expr.from_tree(body),
-                )
+        return Bind(range=range, id=Id.from_tree(id), value=value)
 
 
 @dataclass
@@ -292,7 +288,7 @@ class Local(Expr):
 
         return Local(
             range=range_of(node),
-            binds=list(map(Bind.from_tree, binds)),
+            binds=[Bind.from_tree(bind) for bind in binds],
             body=Expr.from_tree(expr),
         )
 
@@ -308,15 +304,13 @@ class Param:
         assert node.type == "param"
         assert 1 <= len(node.named_children) <= 2
 
-        [id_node, *tail] = node.named_children
+        id_node, *maybe_value = node.named_children
 
-        match tail:
-            case [value_node]:
-                value = Expr.from_tree(value_node)
-            case _:
-                value = None
-
-        return Param(range=range_of(node), id=Id.from_tree(id_node), value=value)
+        return Param(
+            range=range_of(node),
+            id=Id.from_tree(id_node),
+            value=next(iter(map(Expr.from_tree, maybe_value)), None),
+        )
 
 
 @dataclass
@@ -329,16 +323,39 @@ class Fn(Expr):
         assert node.type == "anonymous_function"
         assert 1 <= len(node.named_children) <= 2
 
-        [*init, body_node] = node.named_children
+        *maybe_params, body_node = node.named_children
 
         return Fn(
             range=range_of(node),
             params=[
                 Param.from_tree(param)
-                for params in init
+                for params in maybe_params
                 for param in params.named_children
             ],
             body=Expr.from_tree(body_node),
+        )
+
+
+@dataclass
+class Call(Expr):
+    fn: Expr
+    args: list[Expr]
+
+    @staticmethod
+    def from_tree(node: T.Node) -> "Call":
+        assert node.type == "functioncall"
+        assert len(node.named_children) >= 1
+
+        fn, *maybe_args = node.named_children
+
+        return Call(
+            range=range_of(node),
+            fn=Expr.from_tree(fn),
+            args=[
+                Expr.from_tree(arg)
+                for args in maybe_args
+                for arg in args.named_children
+            ],
         )
 
 
@@ -354,6 +371,7 @@ class ForSpec:
         assert len(node.named_children) == 2
 
         id, expr = node.named_children
+
         return ForSpec(
             range_of(node),
             Id.from_tree(id),
@@ -371,10 +389,9 @@ class IfSpec:
         assert node.type == "ifspec"
         assert len(node.named_children) == 1
 
-        [condition] = node.named_children
         return IfSpec(
             range_of(node),
-            Expr.from_tree(condition),
+            condition=next(map(Expr.from_tree, node.named_children)),
         )
 
 
@@ -389,7 +406,8 @@ class ListComp(Expr):
         assert node.type == "forloop"
         assert len(node.named_children) >= 2
 
-        [expr, for_spec, *rest] = node.named_children
+        expr, for_spec, *maybe_comp_spec = node.named_children
+
         return ListComp(
             range=range_of(node),
             expr=Expr.from_tree(expr),
@@ -398,7 +416,7 @@ class ListComp(Expr):
                 ForSpec.from_tree(spec)
                 if spec.type == "forspec"
                 else IfSpec.from_tree(spec)
-                for comp_spec in rest
+                for comp_spec in maybe_comp_spec
                 for spec in comp_spec.named_children
             ],
         )
@@ -559,6 +577,7 @@ class TestDocument:
         match value, literal:
             case int(), None:
                 literal = str(value)
+                value = float(value)
             case _:
                 assert literal is not None
 
@@ -607,6 +626,46 @@ class TestAST(unittest.TestCase):
                 range=t.body.range,
                 binds=[t.id("x").bind(t.num(1))],
                 body=t.id("x", nth=2),
+            ),
+        )
+
+    def test_local_bind_fn(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local
+                    f1(x) = x + 1,
+                    f2(y) = y + 2;
+                f2(1)
+                """
+            )
+        )
+
+        self.assertEqual(
+            t.body,
+            Local(
+                range=t.body.range,
+                binds=[
+                    t.id("f1", line=2).bind(
+                        Fn(
+                            range=t.range_of("f1(x) = x + 1", line=2),
+                            params=[t.param("x", line=2)],
+                            body=t.id("x", line=2, nth=2) + t.num(1, line=2, nth=2),
+                        )
+                    ),
+                    t.id("f2", line=3).bind(
+                        Fn(
+                            range=t.range_of("f2(y) = y + 2", line=3),
+                            params=[t.param("y", line=3)],
+                            body=t.id("y", line=3, nth=2) + t.num(2, line=3, nth=2),
+                        )
+                    ),
+                ],
+                body=Call(
+                    range=t.range_of("f2(1)", line=4),
+                    fn=t.id("f2", line=4),
+                    args=[t.num(1, line=4)],
+                ),
             ),
         )
 
@@ -701,14 +760,14 @@ class TestAST(unittest.TestCase):
         )
 
     def test_fn(self):
-        t = TestDocument("function(x = 1, y = 2) x + y")
+        t = TestDocument("function(x, y = 2) x + y")
 
         self.assertEqual(
             t.body,
             Fn(
                 t.body.range,
                 params=[
-                    t.param("x", value=t.num(1)),
+                    t.param("x"),
                     t.param("y", value=t.num(2)),
                 ],
                 body=t.id("x", nth=2) + t.id("y", nth=2),
@@ -731,7 +790,6 @@ def serve():
 
 @app.command()
 def test():
-    print(parse("local f() = 1; f()"))
     unittest.main(argv=["--locals"], verbosity=1)
 
 
