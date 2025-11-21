@@ -12,6 +12,7 @@
 
 import logging
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from textwrap import dedent
@@ -760,13 +761,19 @@ class Indexer(Visitor):
         self.visit(tree)
 
     def visit_bind(self, b: Bind):
-        parent = self.breadcrumbs[-1]
-        symbol = L.DocumentSymbol(
+        var_symbol = L.DocumentSymbol(
             name=b.id.name,
             kind=L.SymbolKind.Variable,
             range=b.id.range,
             selection_range=b.range,
         )
+
+        with self.parent_symbol(var_symbol):
+            self.visit(b.value)
+
+    @contextmanager
+    def parent_symbol(self, symbol: L.DocumentSymbol):
+        parent = self.breadcrumbs[-1]
 
         match parent.children:
             case list():
@@ -775,8 +782,11 @@ class Indexer(Visitor):
                 parent.children = [symbol]
 
         self.breadcrumbs.append(symbol)
-        self.visit(b.value)
-        self.breadcrumbs.pop()
+
+        try:
+            yield symbol
+        finally:
+            self.breadcrumbs.pop()
 
 
 server = LanguageServer("just", "v0.1")
