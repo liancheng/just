@@ -34,6 +34,9 @@ logging.basicConfig(
     level=logging.DEBUG,
 )
 
+log = logging.root
+
+
 ExprType = TypeVar("ExprType")
 
 
@@ -136,8 +139,8 @@ class Id(Expr):
     def bind(self, value: Expr) -> "Bind":
         return Bind(merge_ranges(self, value), self, value)
 
-    def arg(self, value: Expr) -> "CallArg":
-        return CallArg(merge_ranges(self, value), value, self)
+    def arg(self, value: Expr) -> "Arg":
+        return Arg(merge_ranges(self, value), value, self)
 
 
 @dataclass
@@ -401,24 +404,24 @@ class Fn(Expr):
 
 
 @dataclass
-class CallArg:
+class Arg:
     range: L.Range
     value: Expr
     name: Id | None = None
 
     @staticmethod
-    def from_tree(node: T.Node) -> "CallArg":
+    def from_tree(node: T.Node) -> "Arg":
         if node.type == "named_argument":
             assert len(node.named_children) == 2
             name, value = node.named_children
 
-            return CallArg(
+            return Arg(
                 range=range_of(node),
                 value=Expr.from_tree(value),
                 name=Id.from_tree(name),
             )
         else:
-            return CallArg(
+            return Arg(
                 range=range_of(node),
                 value=Expr.from_tree(node),
             )
@@ -427,7 +430,7 @@ class CallArg:
 @dataclass
 class Call(Expr):
     fn: Expr
-    args: list[CallArg]
+    args: list[Arg]
 
     @staticmethod
     def from_tree(node: T.Node) -> "Call":
@@ -440,9 +443,7 @@ class Call(Expr):
             range=range_of(node),
             fn=Expr.from_tree(fn),
             args=[
-                CallArg.from_tree(arg)
-                for args in maybe_args
-                for arg in args.named_children
+                Arg.from_tree(arg) for args in maybe_args for arg in args.named_children
             ],
         )
 
@@ -563,6 +564,120 @@ class AssertExpr(Expr):
         )
 
 
+class Visitor:
+    def visit(self, tree: Expr):
+        match tree:
+            case Document() as e:
+                self.visit_document(e)
+            case Id() as e:
+                self.visit_id(e)
+            case Str() as e:
+                self.visit_str(e)
+            case Num() as e:
+                self.visit_num(e)
+            case Bool() as e:
+                self.visit_bool(e)
+            case Array() as e:
+                self.visit_array(e)
+            case Binary() as e:
+                self.visit_binary(e)
+            case Local() as e:
+                self.visit_local(e)
+            case Fn() as e:
+                self.visit_fn(e)
+            case Call() as e:
+                self.visit_call(e)
+            case ListComp() as e:
+                self.visit_list_comp(e)
+            case Import() as e:
+                self.visit_import(e)
+            case AssertExpr() as e:
+                self.visit_assert_expr(e)
+
+    def visit_document(self, e: Document):
+        self.visit(e.body)
+
+    def visit_id(self, e: Id):
+        del e
+
+    def visit_str(self, e: Str):
+        del e
+
+    def visit_num(self, e: Num):
+        del e
+
+    def visit_bool(self, e: Bool):
+        del e
+
+    def visit_array(self, e: Array):
+        for v in e.values:
+            self.visit(v)
+
+    def visit_binary(self, e: Binary):
+        self.visit(e.lhs)
+        self.visit(e.rhs)
+
+    def visit_local(self, e: Local):
+        for b in e.binds:
+            self.visit_bind(b)
+        self.visit(e.body)
+
+    def visit_bind(self, b: Bind):
+        self.visit_id(b.id)
+        self.visit(b.value)
+
+    def visit_fn(self, e: Fn):
+        for p in e.params:
+            self.visit_param(p)
+        self.visit(e.body)
+
+    def visit_param(self, p: Param):
+        self.visit_id(p.name)
+        if p.value is not None:
+            self.visit(p.value)
+
+    def visit_call(self, e: Call):
+        self.visit(e.fn)
+        for a in e.args:
+            self.visit_arg(a)
+
+    def visit_arg(self, a: Arg):
+        if a.name is not None:
+            self.visit(a.name)
+        self.visit(a.value)
+
+    def visit_list_comp(self, e: ListComp):
+        self.visit_for_spec(e.for_spec)
+
+        for s in e.comp_spec:
+            match s:
+                case ForSpec() as f:
+                    self.visit_for_spec(f)
+                case IfSpec() as i:
+                    self.visit_if_spec(i)
+
+        self.visit(e.expr)
+
+    def visit_for_spec(self, s: ForSpec):
+        self.visit(s.expr)
+        self.visit_id(s.id)
+
+    def visit_if_spec(self, s: IfSpec):
+        self.visit(s.condition)
+
+    def visit_import(self, e: Import):
+        self.visit_str(e.path)
+
+    def visit_assert_expr(self, e: AssertExpr):
+        self.visit_assert(e.assertion)
+        self.visit(e.body)
+
+    def visit_assert(self, a: Assert):
+        self.visit(a.condition)
+        if a.message is not None:
+            self.visit(a.message)
+
+
 def position_of(point: T.Point) -> L.Position:
     return L.Position(point.row, point.column)
 
@@ -574,10 +689,35 @@ def range_of(node: T.Node) -> L.Range:
     )
 
 
-def merge_ranges(
-    lhs: L.Range | T.Range | T.Node | Expr,
-    rhs: L.Range | T.Range | T.Node | Expr,
-) -> L.Range:
+PositionLike = L.Position | T.Point
+
+
+def position_before(lhs: PositionLike, rhs: PositionLike):
+    match lhs:
+        case L.Position() as p:
+            lhs_line = p.line
+            lhs_character = p.character
+        case T.Point() as p:
+            lhs_line = p.row
+            lhs_character = p.column
+
+    match rhs:
+        case L.Position() as p:
+            rhs_line = p.line
+            rhs_character = p.character
+        case T.Point() as p:
+            rhs_line = p.row
+            rhs_character = p.column
+
+    return (
+        lhs_line < rhs_line or lhs_line == rhs_line and lhs_character <= rhs_character
+    )
+
+
+RangeLike = L.Range | T.Range | T.Node | Expr
+
+
+def merge_ranges(lhs: RangeLike, rhs: RangeLike) -> L.Range:
     match lhs:
         case L.Range() as r:
             start = r.start
@@ -598,18 +738,60 @@ def merge_ranges(
         case Expr() as e:
             end = e.range.end
 
+    assert position_before(start, end)
+
     return L.Range(start, end)
-
-
-server = LanguageServer("pj", "v0.1")
 
 
 def parse(source: str) -> T.Node:
     return get_parser("jsonnet").parse(source.encode("utf-8")).root_node
 
 
+class Indexer(Visitor):
+    def __init__(self, tree: Expr) -> None:
+        self.root_symbol = L.DocumentSymbol(
+            name="__root__",
+            kind=L.SymbolKind.Variable,
+            range=tree.range,
+            selection_range=tree.range,
+        )
+
+        self.breadcrumbs = [self.root_symbol]
+        self.visit(tree)
+
+    def visit_bind(self, b: Bind):
+        parent = self.breadcrumbs[-1]
+        symbol = L.DocumentSymbol(
+            name=b.id.name,
+            kind=L.SymbolKind.Variable,
+            range=b.id.range,
+            selection_range=b.range,
+        )
+
+        match parent.children:
+            case list():
+                parent.children.append(symbol)
+            case None:
+                parent.children = [symbol]
+
+        self.breadcrumbs.append(symbol)
+        self.visit(b.value)
+        self.breadcrumbs.pop()
+
+
+server = LanguageServer("just", "v0.1")
+
+
 def document_root(uri: str) -> T.Node:
     return parse(server.workspace.get_text_document(uri).source)
+
+
+@server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
+def document_symbol(params: L.DocumentColorParams):
+    root_node = document_root(params.text_document.uri)
+    tree = Expr.from_tree(root_node)
+    indexer = Indexer(tree)
+    return indexer.root_symbol.children
 
 
 @server.feature(L.TEXT_DOCUMENT_COMPLETION)
@@ -719,8 +901,8 @@ class TestDocument:
         range = id.range if value is None else merge_ranges(id, value)
         return Param(range, id, value)
 
-    def arg(self, value: Expr) -> CallArg:
-        return CallArg(value.range, value)
+    def arg(self, value: Expr) -> Arg:
+        return Arg(value.range, value)
 
 
 class TestAST(unittest.TestCase):
