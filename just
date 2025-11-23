@@ -13,7 +13,7 @@
 import logging
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields
 from enum import StrEnum
 from textwrap import dedent
 from typing import Any, Type, TypeVar, cast
@@ -22,7 +22,7 @@ import lsprotocol.types as L
 import tree_sitter as T
 import typer
 from pygls.lsp.server import LanguageServer
-from tree_sitter_language_pack import get_language, get_parser
+from tree_sitter_language_pack import get_parser
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -42,12 +42,59 @@ ExprType = TypeVar("ExprType")
 
 
 @dataclass
-class HasRange:
+class AST:
     range: L.Range
+
+    @property
+    def pretty_tree(self) -> str:
+        @dataclass
+        class PrettyNode:
+            value: Any
+            label: str | None = None
+
+            def __repr__(self):
+                match self.value:
+                    case AST() as ast:
+                        repr = f"{ast.__class__.__name__} [{ast.range}]"
+                    case [_, *_]:
+                        repr = "[...]"
+                    case _:
+                        repr = str(self.value)
+
+                return repr if self.label is None else f"{self.label}={repr}"
+
+            @property
+            def children(self) -> list["PrettyNode"]:
+                match self.value:
+                    case AST() as ast:
+                        return [
+                            PrettyNode(getattr(ast, f.name), f.name)
+                            for f in fields(ast)
+                            if f.name != "range"
+                        ]
+                    case list() as elems:
+                        return [PrettyNode(e) for e in elems]
+                    case _:
+                        return []
+
+        def dump(buf: list[str], nodes: list[PrettyNode], branches: str = ""):
+            for i in range(len(nodes)):
+                last = i == len(nodes) - 1
+                new_branch = " " * 4 if last else ":   "
+                fork = "`-- " if last else ":-- "
+
+                buf.append(f"{branches}{fork}{nodes[i]}")
+                dump(buf, nodes[i].children, branches + new_branch)
+
+        root = PrettyNode(self)
+        lines = [str(root)]
+        dump(lines, root.children)
+
+        return "\n".join(lines)
 
 
 @dataclass
-class Expr(HasRange):
+class Expr(AST):
     @staticmethod
     def from_tree(node: T.Node) -> "Expr":
         global dispatch
@@ -113,69 +160,6 @@ class Expr(HasRange):
 
     def not_eq(self, rhs: "Expr") -> "Binary":
         return self.bin_op(Operator.NotEq, rhs)
-
-    @property
-    def pretty_tree(self) -> str:
-        lines = []
-
-        def class_name_of(value: Any) -> str:
-            return value.__class__.__name__
-
-        def children_of(value: Any) -> list[Any]:
-            match value:
-                # When `value` is a `dataclass`, returns all the fields that are not the
-                # "range" field, which is printed as part of the tree node label.
-                case d if is_dataclass(d):
-                    return [
-                        (f.name, getattr(d, f.name))
-                        for f in fields(d)
-                        if f.name != "range"
-                    ]
-                # When `value` is a field of a `dataclass`, and itself is a list.
-                case _, [*children]:
-                    return children
-                case _, child if is_dataclass(child):
-                    return children_of(child)
-                case _:
-                    return []
-
-        def label_of(value: Any) -> str:
-            match value:
-                case HasRange() as r:
-                    return f"{class_name_of(value)} [{r.range}]"
-                case d if is_dataclass(d):
-                    return f"{class_name_of(value)}"
-                case field_name, []:
-                    return f"{field_name}=[]"
-                case field_name, list():
-                    return f"{field_name}=[...]"
-                case field_name, v:
-                    return f"{field_name}={label_of(v)}"
-                case _:
-                    return str(value)
-
-        def build(value: Any, depth: int, last_chidren: list[bool]):
-            line = ""
-
-            if depth > 0:
-                for is_last_child in last_chidren[:-1]:
-                    line += " " * 3 if is_last_child else " │ "
-                line += " └╴" if last_chidren[-1] else " ├╴"
-
-            line += label_of(value)
-            lines.append(line)
-
-            match children_of(value):
-                case [*init, last]:
-                    for child in init:
-                        build(child, depth + 1, last_chidren + [False])
-                    build(last, depth + 1, last_chidren + [True])
-                case _:
-                    pass
-
-        build(self, depth=0, last_chidren=[])
-
-        return "\n".join(lines)
 
 
 @dataclass
@@ -359,7 +343,7 @@ def parse_expr(nodes: list[T.Node]) -> Expr:
 
 
 @dataclass
-class Bind(HasRange):
+class Bind(AST):
     id: Id
     value: Expr
 
@@ -427,7 +411,7 @@ class Local(Expr):
 
 
 @dataclass
-class Param(HasRange):
+class Param(AST):
     name: Id
     value: Expr | None = None
 
@@ -469,7 +453,7 @@ class Fn(Expr):
 
 
 @dataclass
-class Arg(HasRange):
+class Arg(AST):
     value: Expr
     name: Id | None = None
 
@@ -513,7 +497,7 @@ class Call(Expr):
 
 
 @dataclass
-class ForSpec(HasRange):
+class ForSpec(AST):
     id: Id
     expr: Expr
 
@@ -532,7 +516,7 @@ class ForSpec(HasRange):
 
 
 @dataclass
-class IfSpec(HasRange):
+class IfSpec(AST):
     condition: Expr
 
     @staticmethod
@@ -592,7 +576,7 @@ class Import(Expr):
 
 
 @dataclass
-class Assert(HasRange):
+class Assert(AST):
     condition: Expr
     message: Expr | None = None
 
@@ -864,54 +848,6 @@ def document_symbol(params: L.DocumentColorParams):
     return indexer.root_symbol.children
 
 
-@server.feature(L.TEXT_DOCUMENT_COMPLETION)
-def completions(params: L.CompletionParams):
-    root_node = document_root(params.text_document.uri)
-    query = T.Query(
-        get_language("jsonnet"),
-        dedent(
-            """\
-            (local_bind
-              (bind (id) @local-bind.function
-                    (params)))
-
-            (local_bind
-              (bind (id) @local-bind.variable
-                    !params))
-
-            (field
-              (fieldname (id) @field.function)
-              (params))
-
-            (field
-              (fieldname (id) @field)
-              !params)
-            """,
-        ),
-    )
-
-    captures = T.QueryCursor(query).captures(root_node)
-
-    def completion_items():
-        patterns = {
-            "local-bind.variable": L.CompletionItemKind.Variable,
-            "local-bind.function": L.CompletionItemKind.Function,
-            "field.function": L.CompletionItemKind.Method,
-            "field": L.CompletionItemKind.Field,
-        }
-
-        for capture, kind in patterns.items():
-            for node in captures.get(capture, []):
-                if node.text is not None:
-                    text = node.text.decode("utf-8")
-                    yield L.CompletionItem(label=text, kind=kind)
-
-    return L.CompletionList(
-        is_incomplete=False,
-        items=list(completion_items()),
-    )
-
-
 class TestDocument:
     def __init__(self, source: str) -> None:
         self.lines = source.splitlines(keepends=False)
@@ -977,82 +913,60 @@ class TestDocument:
 
 class TestAST(unittest.TestCase):
     def assertExprEqual(self, actual, expected):
-        self.assertEqual(
-            actual,
-            expected,
-            msg="\n".join(
-                [
-                    "\n",
-                    "Actual",
-                    "------",
-                    actual.pretty_tree,
-                    "",
-                    "Expected",
-                    "--------",
-                    expected.pretty_tree,
-                ]
-            ),
+        self.assertMultiLineEqual(
+            actual.pretty_tree,
+            expected.pretty_tree,
         )
 
     def test_pretty_tree(self):
-        self.maxDiff = None
+        def check(source: str, expected: str):
+            self.assertMultiLineEqual(
+                TestDocument(source).body.pretty_tree,
+                expected.strip(),
+            )
 
-        t = TestDocument(
+        check(
+            "1",
             dedent(
                 """\
-                local
-                    v0 = 1,
-                    v1 = local f0(x) = x + 2; f0(3);
-                v0 + v1
+                Num [0:0-0:1]
+                `-- value=1.0
                 """
-            )
+            ),
         )
 
-        self.assertEqual(
-            t.body.pretty_tree,
+        check(
+            "'f' + 1",
             dedent(
                 """\
-                Local [0:0-3:7]
-                 ├╴binds=[...]
-                 │  ├╴Bind [1:4-1:10]
-                 │  │  ├╴id=Id [1:4-1:6]
-                 │  │  │  └╴name=v0
-                 │  │  └╴value=Num [1:9-1:10]
-                 │  │     └╴value=1.0
-                 │  └╴Bind [2:4-2:35]
-                 │     ├╴id=Id [2:4-2:6]
-                 │     │  └╴name=v1
-                 │     └╴value=Local [2:9-2:35]
-                 │        ├╴binds=[...]
-                 │        │  └╴Bind [2:15-2:28]
-                 │        │     ├╴id=Id [2:15-2:17]
-                 │        │     │  └╴name=f0
-                 │        │     └╴value=Fn [2:15-2:28]
-                 │        │        ├╴params=[...]
-                 │        │        │  └╴Param [2:18-2:19]
-                 │        │        │     ├╴name=Id [2:18-2:19]
-                 │        │        │     │  └╴name=x
-                 │        │        │     └╴value=None
-                 │        │        └╴body=Binary [2:23-2:28]
-                 │        │           ├╴op=+
-                 │        │           ├╴lhs=Id [2:23-2:24]
-                 │        │           │  └╴name=x
-                 │        │           └╴rhs=Num [2:27-2:28]
-                 │        │              └╴value=2.0
-                 │        └╴body=Call [2:30-2:35]
-                 │           ├╴fn=Id [2:30-2:32]
-                 │           │  └╴name=f0
-                 │           └╴args=[...]
-                 │              └╴Arg [2:33-2:34]
-                 │                 ├╴value=Num [2:33-2:34]
-                 │                 │  └╴value=3.0
-                 │                 └╴name=None
-                 └╴body=Binary [3:0-3:7]
-                    ├╴op=+
-                    ├╴lhs=Id [3:0-3:2]
-                    │  └╴name=v0
-                    └╴rhs=Id [3:5-3:7]
-                       └╴name=v1"""
+                Binary [0:0-0:7]
+                :-- op=+
+                :-- lhs=Str [0:0-0:3]
+                :   `-- raw=f
+                `-- rhs=Num [0:6-0:7]
+                    `-- value=1.0
+                """
+            ),
+        )
+
+        check(
+            "local x = 1; x + 2",
+            dedent(
+                """\
+                Local [0:0-0:18]
+                :-- binds=[...]
+                :   `-- Bind [0:6-0:11]
+                :       :-- id=Id [0:6-0:7]
+                :       :   `-- name=x
+                :       `-- value=Num [0:10-0:11]
+                :           `-- value=1.0
+                `-- body=Binary [0:13-0:18]
+                    :-- op=+
+                    :-- lhs=Id [0:13-0:14]
+                    :   `-- name=x
+                    `-- rhs=Num [0:17-0:18]
+                        `-- value=2.0
+                """
             ),
         )
 
