@@ -50,7 +50,7 @@ class AST:
         def grow(buf: list[str], nodes: list[PrettyNode], branches: str = ""):
             for i in range(len(nodes)):
                 last = i == len(nodes) - 1
-                new_branch = " " * 4 if last else "|   "
+                new_branch = ".   " if last else "|   "
                 fork = "`-- " if last else "|-- "
 
                 buf.append(f"{branches}{fork}{nodes[i]}")
@@ -1143,7 +1143,7 @@ class TestAST(unittest.TestCase):
                 |-- lhs=Str [0:0-0:3]
                 |   `-- raw="f"
                 `-- rhs=Num [0:6-0:7]
-                    `-- value=1.0
+                .   `-- value=1.0
                 """
             ),
         )
@@ -1155,16 +1155,16 @@ class TestAST(unittest.TestCase):
                 Local [0:0-0:18]
                 |-- binds=[...]
                 |   `-- [0]=Bind [0:6-0:11]
-                |       |-- id=Id [0:6-0:7]
-                |       |   `-- name="x"
-                |       `-- value=Num [0:10-0:11]
-                |           `-- value=1.0
+                |   .   |-- id=Id [0:6-0:7]
+                |   .   |   `-- name="x"
+                |   .   `-- value=Num [0:10-0:11]
+                |   .   .   `-- value=1.0
                 `-- body=Binary [0:13-0:18]
-                    |-- op="+"
-                    |-- lhs=Id [0:13-0:14]
-                    |   `-- name="x"
-                    `-- rhs=Num [0:17-0:18]
-                        `-- value=2.0
+                .   |-- op="+"
+                .   |-- lhs=Id [0:13-0:14]
+                .   |   `-- name="x"
+                .   `-- rhs=Num [0:17-0:18]
+                .   .   `-- value=2.0
                 """
             ),
         )
