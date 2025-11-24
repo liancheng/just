@@ -43,6 +43,11 @@ ExprType = TypeVar("ExprType")
 
 @dataclass
 class AST:
+    # TODO
+    #
+    # - Use `L.Location` instead of `L.Range` to include document URI and enable
+    #   cross-document references.
+    # - Record the original TS node to track byte offset.
     range: L.Range
 
     @property
@@ -924,13 +929,16 @@ class Index(Visitor):
 
     def visit_id(self, e: Id):
         if binding := self.scope.get(e):
-            defs = self.def_index.get(HashableRange(e.range), [])
-            defs.append(binding.id)
-            self.def_index[HashableRange(e.range)] = defs
+            self.new_ref(e, binding)
 
-            refs = self.ref_index.get(HashableRange(binding.id.range), [])
-            refs.append(e)
-            self.ref_index[HashableRange(binding.id.range)] = refs
+    def new_ref(self, ref: Id, binding: Binding):
+        defs = self.def_index.get(HashableRange(ref.range), [])
+        defs.append(binding.id)
+        self.def_index[HashableRange(ref.range)] = defs
+
+        refs = self.ref_index.get(HashableRange(binding.id.range), [])
+        refs.append(ref)
+        self.ref_index[HashableRange(binding.id.range)] = refs
 
     @contextmanager
     def parent_symbol(self, symbol: L.DocumentSymbol):
@@ -1015,36 +1023,27 @@ def document_symbol(ls: JustLanguageServer, params: L.DocumentColorParams):
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
 def definition(ls: JustLanguageServer, params: L.DefinitionParams):
     uri = params.text_document.uri
-    index = ls.index(uri)
-    pos = params.position
-    defs = next(
+    return next(
         iter(
-            defs
-            for key, defs in index.def_index.items()
-            if range_contains(key.range, pos)
+            [L.Location(uri, id.range) for id in ids]
+            for key, ids in ls.index(uri).def_index.items()
+            if range_contains(key.range, params.position)
         ),
         [],
     )
-
-    return [L.Location(uri, id.range) for id in defs]
 
 
 @server.feature(L.TEXT_DOCUMENT_REFERENCES)
 def references(ls: JustLanguageServer, params: L.ReferenceParams):
     uri = params.text_document.uri
-    index = ls.index(uri)
-    pos = params.position
-
-    refs = next(
+    return next(
         iter(
-            refs
-            for key, refs in index.ref_index.items()
-            if range_contains(key.range, pos)
+            [L.Location(uri, id.range) for id in ids]
+            for key, ids in ls.index(uri).ref_index.items()
+            if range_contains(key.range, params.position)
         ),
         [],
     )
-
-    return [L.Location(uri, id.range) for id in refs]
 
 
 class TestDocument:
