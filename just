@@ -15,8 +15,9 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import StrEnum
+from pathlib import Path
 from textwrap import dedent
-from typing import Any, Type, TypeVar, cast
+from typing import Annotated, Any, Type, TypeVar, cast
 
 import lsprotocol.types as L
 import tree_sitter as T
@@ -1281,6 +1282,19 @@ class TestAST(unittest.TestCase):
 @app.command()
 def serve():
     server.start_io()
+
+
+@app.command()
+def tree(
+    path: Annotated[
+        Path,
+        typer.Argument(
+            help="The Jsonnet file to print.",
+            allow_dash=True,
+        ),
+    ],
+):
+    print(Expr.from_tree(parse(path.read_text())).pretty_tree)
 
 
 @app.command()
