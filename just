@@ -813,7 +813,7 @@ def parse(source: str) -> T.Node:
     return get_parser("jsonnet").parse(source.encode("utf-8")).root_node
 
 
-class Indexer(Visitor):
+class Index(Visitor):
     def __init__(self, tree: Expr) -> None:
         self.root_symbol = L.DocumentSymbol(
             name="__root__",
@@ -826,15 +826,46 @@ class Indexer(Visitor):
         self.visit(tree)
 
     def visit_bind(self, b: Bind):
-        var_symbol = L.DocumentSymbol(
+        match b.value:
+            case Fn():
+                kind = L.SymbolKind.Function
+            case _:
+                kind = L.SymbolKind.Variable
+
+        symbol = L.DocumentSymbol(
             name=b.id.name,
-            kind=L.SymbolKind.Variable,
+            kind=kind,
             range=b.id.range,
             selection_range=b.range,
         )
 
-        with self.parent_symbol(var_symbol):
+        with self.parent_symbol(symbol):
             self.visit(b.value)
+
+    def visit_param(self, p: Param):
+        symbol = L.DocumentSymbol(
+            name=p.name.name,
+            kind=L.SymbolKind.Variable,
+            range=p.name.range,
+            selection_range=p.range,
+        )
+
+        with self.parent_symbol(symbol):
+            if p.value is not None:
+                self.visit(p.value)
+
+    def visit_for_spec(self, s: ForSpec):
+        self.visit(s.expr)
+
+        symbol = L.DocumentSymbol(
+            name=s.id.name,
+            kind=L.SymbolKind.Variable,
+            range=s.id.range,
+            selection_range=s.id.range,
+        )
+
+        with self.parent_symbol(symbol):
+            pass
 
     @contextmanager
     def parent_symbol(self, symbol: L.DocumentSymbol):
@@ -854,19 +885,56 @@ class Indexer(Visitor):
             self.breadcrumbs.pop()
 
 
-server = LanguageServer("just", "v0.1")
+class JustLanguageServer(LanguageServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.docs: dict[str, Index] = {}
+
+    def document_root(self, uri: str) -> T.Node:
+        return parse(self.workspace.get_text_document(uri).source)
+
+    def refresh_index(self, uri: str) -> Index:
+        index = Index(Expr.from_tree(self.document_root(uri)))
+        self.docs[uri] = index
+        return index
+
+    def index(self, uri: str) -> Index:
+        if uri not in self.docs:
+            self.refresh_index(uri)
+        return self.docs[uri]
 
 
-def document_root(uri: str) -> T.Node:
-    return parse(server.workspace.get_text_document(uri).source)
+server = JustLanguageServer("just", "v0.1")
+
+
+@server.feature(L.INITIALIZE)
+def initialize(_: L.InitializeParams):
+    return L.InitializeResult(
+        capabilities=L.ServerCapabilities(
+            document_symbol_provider=True,
+            text_document_sync=L.TextDocumentSyncKind.Full,
+        ),
+        server_info=L.ServerInfo(
+            name="just",
+            version="v0.1",
+        ),
+    )
+
+
+@server.feature(L.TEXT_DOCUMENT_DID_OPEN)
+def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
+    ls.refresh_index(params.text_document.uri)
+
+
+@server.feature(L.NOTEBOOK_DOCUMENT_DID_CHANGE)
+def did_change(ls: JustLanguageServer, params: L.DidChangeTextDocumentParams):
+    ls.refresh_index(params.text_document.uri)
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
-def document_symbol(params: L.DocumentColorParams):
-    root_node = document_root(params.text_document.uri)
-    tree = Expr.from_tree(root_node)
-    indexer = Indexer(tree)
-    return indexer.root_symbol.children
+def document_symbol(ls: JustLanguageServer, params: L.DocumentColorParams):
+    uri = params.text_document.uri
+    return ls.index(uri).root_symbol.children
 
 
 class TestDocument:
