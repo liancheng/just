@@ -15,7 +15,7 @@ import sys
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from enum import StrEnum
+from enum import ReprEnum, StrEnum
 from pathlib import Path
 from textwrap import dedent
 from typing import Annotated, Any, ClassVar, Optional, Type, TypeVar, cast
@@ -39,12 +39,14 @@ logging.basicConfig(
 
 log = logging.root
 
+LANG_JSONNET = get_language("jsonnet")
+
 
 ASTType = TypeVar("ASTType")
 
 
 def strip_comments(nodes: list[T.Node]) -> list[T.Node]:
-    return [node for node in nodes if not node.is_extra]
+    return [node for node in nodes if not node.type == "comment"]
 
 
 @dataclass
@@ -74,6 +76,7 @@ class AST:
             "document": Document.from_doc,
             "false": Bool.from_doc,
             "fieldname": FieldName.from_doc,
+            "field": Field.from_doc,
             "forloop": ListComp.from_doc,
             "forspec": ForSpec.from_doc,
             "functioncall": Call.from_doc,
@@ -344,7 +347,7 @@ class Binary(Expr):
 
         return Binary(
             location=location_of(uri, node),
-            op=Operator(op.text.decode("utf-8")),
+            op=Operator(op.text.decode()),
             lhs=Expr.from_doc(uri, lhs),
             rhs=Expr.from_doc(uri, rhs),
         )
@@ -676,35 +679,78 @@ class FieldName(AST):
 
         if head.text.decode() == "[":
             e, *_ = tail
-            return DynamicFieldName(location, Expr.from_doc(uri, e))
+            return Dynamic(location, Expr.from_doc(uri, e))
         elif head.type == "id":
-            return FixedFieldName(location, Id.from_doc(uri, head))
+            return Fixed(location, Id.from_doc(uri, head))
         else:
-            return FixedFieldName(location, Str.from_doc(uri, head))
+            return Fixed(location, Str.from_doc(uri, head))
 
 
 @dataclass
-class FixedFieldName(FieldName):
+class Fixed(FieldName):
     name: Id | Str
 
 
 @dataclass
-class DynamicFieldName(FieldName):
+class Dynamic(FieldName):
     expr: Expr
 
 
-class Visibility(StrEnum):
-    Default = ":"
-    Hidden = "::"
-    Forced = ":::"
+class Visibility(bytes, ReprEnum):
+    Default = b":"
+    Hidden = b"::"
+    Forced = b":::"
 
 
 @dataclass
 class Field(AST):
     key: FieldName
     value: Expr
-    visibility: Visibility
-    inherited: bool
+    visibility: Visibility = Visibility.Default
+    inherited: bool = False
+
+    @staticmethod
+    def from_doc(uri: str, node: T.Node) -> "Field":
+        assert node.type == "field"
+        children = strip_comments(node.children)
+
+        if len(node.children_by_field_name("function")) == 0:
+            key, plus_or_vis, *rest = children
+
+            match plus_or_vis:
+                case plus if plus.text == b"+":
+                    vis, value, *_ = rest
+                    return Field(
+                        location=location_of(uri, node),
+                        key=FieldName.from_doc(uri, key),
+                        value=Expr.from_doc(uri, value),
+                        visibility=Visibility(vis.text),
+                        inherited=True,
+                    )
+                case vis:
+                    value, *_ = rest
+                    return Field(
+                        location=location_of(uri, node),
+                        key=FieldName.from_doc(uri, key),
+                        value=Expr.from_doc(uri, value),
+                        visibility=Visibility(vis.text),
+                        inherited=False,
+                    )
+        else:
+            key, _, params, _, vis, body, *_ = children
+            return Field(
+                location=location_of(uri, node),
+                key=FieldName.from_doc(uri, key),
+                value=Fn(
+                    location_of(uri, node),
+                    params=[
+                        Param.from_doc(uri, param)
+                        for param in strip_comments(params.named_children)
+                    ],
+                    body=Expr.from_doc(uri, body),
+                ),
+                visibility=Visibility(vis.text),
+            )
 
 
 @dataclass
@@ -969,7 +1015,7 @@ def merge_locations(lhs: LocationLike, rhs: LocationLike) -> L.Location:
 
 
 def parse(source: str) -> T.Node:
-    return get_parser("jsonnet").parse(source.encode("utf-8")).root_node
+    return get_parser("jsonnet").parse(source.encode()).root_node
 
 
 @dataclass
@@ -1268,6 +1314,10 @@ class TestDocument:
 
 
 class TestAST(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.maxDiff = None
+
     def assertAstEqual(self, tree_or_source: AST | str, expected: AST | str):
         match tree_or_source, expected:
             case AST() as tree, str():
@@ -1672,24 +1722,37 @@ class TestAST(unittest.TestCase):
         [node] = captures[capture]
         self.assertAstEqual(AST.from_doc(doc.uri, node), expected)
 
-    def test_object_field_name(self):
-        query = T.Query(
-            get_language("jsonnet"),
-            dedent(
-                """\
-                (object
-                  (member
-                    (field (fieldname) @field_name
-                           (_) @field_value) @field))
-                """
-            ),
-        )
+    object_query = T.Query(
+        LANG_JSONNET,
+        dedent(
+            """\
+            (object
+              (member
+                (field
+                  (fieldname) @field_name
+                  "+"? @inherited
+                  [":" "::" ":::"] @visibility
+                  (_) @field_value) @field)*) @object
 
+            (object
+              (member
+                (field
+                  function: (fieldname) @field_name
+                  "("
+                  (params)? @params
+                  ")"
+                  [":" "::" ":::"] @visibility
+                  (_) @function_body) @field)*) @object
+            """
+        ),
+    )
+
+    def test_object_field_name(self):
         t = TestDocument("local x = 'f'; { [x]: 1 }")
 
         self.assertAstEqual(
-            t.query_one(query, "field_name"),
-            DynamicFieldName(
+            t.query_one(self.object_query, "field_name"),
+            Dynamic(
                 t.location_of("[x]"),
                 t.id("x", nth=2),
             ),
@@ -1698,8 +1761,8 @@ class TestAST(unittest.TestCase):
         t = TestDocument("{ x: 1 }")
 
         self.assertAstEqual(
-            t.query_one(query, "field_name"),
-            FixedFieldName(
+            t.query_one(self.object_query, "field_name"),
+            Fixed(
                 t.location_of("x"),
                 t.id("x"),
             ),
@@ -1708,10 +1771,54 @@ class TestAST(unittest.TestCase):
         t = TestDocument("{ 'x': 1 }")
 
         self.assertAstEqual(
-            t.query_one(query, "field_name"),
-            FixedFieldName(
+            t.query_one(self.object_query, "field_name"),
+            Fixed(
                 t.location_of("'x'"),
                 t.str("x", literal="'x'"),
+            ),
+        )
+
+    def test_object_field(self):
+        t = TestDocument("{ x: 1 }")
+
+        self.assertAstEqual(
+            t.query_one(self.object_query, "field"),
+            Field(
+                location=t.location_of("x: 1"),
+                key=Fixed(t.location_of("x"), t.id("x")),
+                value=t.num(1),
+            ),
+        )
+
+        t = TestDocument("{ x+::: 1 }")
+
+        self.assertAstEqual(
+            t.query_one(self.object_query, "field"),
+            Field(
+                location=t.location_of("x+::: 1"),
+                key=Fixed(t.location_of("x"), t.id("x")),
+                value=t.num(1),
+                visibility=Visibility.Forced,
+                inherited=True,
+            ),
+        )
+
+        t = TestDocument("{ f(p1, p2 = 0):: p1 + p2 }")
+
+        self.assertAstEqual(
+            t.query_one(self.object_query, "field"),
+            Field(
+                location=t.location_of("f(p1, p2 = 0):: p1 + p2"),
+                key=Fixed(t.location_of("f"), t.id("f")),
+                value=Fn(
+                    t.location_of("f(p1, p2 = 0):: p1 + p2"),
+                    params=[
+                        t.param("p1"),
+                        t.param("p2", default=t.num(0)),
+                    ],
+                    body=t.id("p1", nth=2) + t.id("p2", nth=2),
+                ),
+                visibility=Visibility.Hidden,
             ),
         )
 
