@@ -24,7 +24,7 @@ import lsprotocol.types as L
 import tree_sitter as T
 import typer
 from pygls.lsp.server import LanguageServer
-from tree_sitter_language_pack import get_parser
+from tree_sitter_language_pack import get_language, get_parser
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -58,6 +58,13 @@ class AST:
         def skip_paren(uri: str, node: T.Node):
             return AST.from_doc(uri, strip_comments(node.named_children)[0])
 
+        def dispatch_object(uri: str, node: T.Node):
+            match strip_comments(node.named_children):
+                case head, *_ if head.type == "objforloop":
+                    return ObjComp.from_doc(uri, node)
+                case _:
+                    return Object.from_doc(uri, node)
+
         dispatch = {
             "anonymous_function": Fn.from_doc,
             "array": Array.from_doc,
@@ -66,6 +73,7 @@ class AST:
             "bind": Bind.from_doc,
             "document": Document.from_doc,
             "false": Bool.from_doc,
+            "fieldname": FieldName.from_doc,
             "forloop": ListComp.from_doc,
             "forspec": ForSpec.from_doc,
             "functioncall": Call.from_doc,
@@ -76,6 +84,7 @@ class AST:
             "local_bind": Local.from_doc,
             "named_argument": Arg.from_doc,
             "number": Num.from_doc,
+            "object": dispatch_object,
             "param": Param.from_doc,
             "parenthesis": skip_paren,
             "string": Str.from_doc,
@@ -656,6 +665,89 @@ class AssertExpr(Expr):
 
 
 @dataclass
+class FieldName(AST):
+    @staticmethod
+    def from_doc(uri: str, node: T.Node) -> "FieldName":
+        assert node.type == "fieldname"
+
+        location = location_of(uri, node)
+        head, *tail = strip_comments(node.children)
+        assert head.text is not None
+
+        if head.text.decode() == "[":
+            e, *_ = tail
+            return DynamicFieldName(location, Expr.from_doc(uri, e))
+        elif head.type == "id":
+            return FixedFieldName(location, Id.from_doc(uri, head))
+        else:
+            return FixedFieldName(location, Str.from_doc(uri, head))
+
+
+@dataclass
+class FixedFieldName(FieldName):
+    name: Id | Str
+
+
+@dataclass
+class DynamicFieldName(FieldName):
+    expr: Expr
+
+
+class Visibility(StrEnum):
+    Default = ":"
+    Hidden = "::"
+    Forced = ":::"
+
+
+@dataclass
+class Field(AST):
+    key: FieldName
+    value: Expr
+    visibility: Visibility
+    inherited: bool
+
+
+@dataclass
+class Object(Expr):
+    binds: list[Bind] = field(default_factory=list)
+    assertions: list[Assert] = field(default_factory=list)
+    fields: list[Field] = field(default_factory=list)
+
+    @staticmethod
+    def from_doc(uri: str, node: T.Node) -> "Object":
+        assert node.type == "object"
+
+        binds = []
+        assertions = []
+        fields = []
+
+        for member in strip_comments(node.named_children):
+            assert member.type == "member"
+
+            head, *_ = strip_comments(member.named_children)
+
+            match head.type:
+                case "objlocal":
+                    _, bind, *_ = strip_comments(head.named_children)
+                    binds.append(Bind.from_doc(uri, bind))
+                case "assert":
+                    assertions.append(Assert.from_doc(uri, head))
+                case "field":
+                    fields.append(Field.from_doc(uri, head))
+
+        return Object(location_of(uri, node), binds, assertions, fields)
+
+
+@dataclass
+class ObjComp(Expr):
+    binds: list[Bind]
+    key: Expr
+    value: Expr
+    for_spec: ForSpec
+    comp_spec: list[ForSpec | IfSpec]
+
+
+@dataclass
 class Unknown(Expr):
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "Expr":
@@ -936,8 +1028,9 @@ class Index(Visitor):
 
         self.breadcrumbs = [self.root_symbol]
         self.scope = Scope()
-        self.def_index: dict[HashableLocation, list[Id]] = {}
-        self.ref_index: dict[HashableLocation, list[Id]] = {}
+
+        self.ref_to_defs: dict[HashableLocation, list[Id]] = {}
+        self.def_to_refs: dict[HashableLocation, list[Id]] = {}
 
         self.visit(tree)
 
@@ -991,13 +1084,13 @@ class Index(Visitor):
             self.new_ref(e, binding)
 
     def new_ref(self, ref: Id, binding: Binding):
-        defs = self.def_index.get(HashableLocation(ref.location), [])
+        defs = self.ref_to_defs.get(HashableLocation(ref.location), [])
         defs.append(binding.id)
-        self.def_index[HashableLocation(ref.location)] = defs
+        self.ref_to_defs[HashableLocation(ref.location)] = defs
 
-        refs = self.ref_index.get(HashableLocation(binding.id.location), [])
+        refs = self.def_to_refs.get(HashableLocation(binding.id.location), [])
         refs.append(ref)
-        self.ref_index[HashableLocation(binding.id.location)] = refs
+        self.def_to_refs[HashableLocation(binding.id.location)] = refs
 
     @contextmanager
     def parent_symbol(self, symbol: L.DocumentSymbol):
@@ -1085,7 +1178,7 @@ def definition(ls: JustLanguageServer, params: L.DefinitionParams):
     return next(
         iter(
             [id.location for id in ids]
-            for key, ids in ls.index(uri).def_index.items()
+            for key, ids in ls.index(uri).ref_to_defs.items()
             if range_contains(key.location.range, params.position)
         ),
         [],
@@ -1098,7 +1191,7 @@ def references(ls: JustLanguageServer, params: L.ReferenceParams):
     return next(
         iter(
             [id.location for id in ids]
-            for key, ids in ls.index(uri).ref_index.items()
+            for key, ids in ls.index(uri).def_to_refs.items()
             if range_contains(key.location.range, params.position)
         ),
         [],
@@ -1109,7 +1202,12 @@ class TestDocument:
     def __init__(self, source: str) -> None:
         self.uri = "file:///tmp/test.jsonnet"
         self.lines = source.splitlines(keepends=False)
-        self.body = Document.from_doc(self.uri, parse(source)).body
+        self.root = parse(source)
+        self.body = Document.from_doc(self.uri, self.root).body
+
+    def query_one(self, query: T.Query, capture: str) -> AST:
+        [node] = T.QueryCursor(query).captures(self.root).get(capture, [])
+        return AST.from_doc(self.uri, node)
 
     def start_of(self, needle: str, line=1, nth=1) -> L.Position:
         assert line >= 1 and nth >= 1
@@ -1515,7 +1613,7 @@ class TestAST(unittest.TestCase):
                 assertion=Assert(
                     location=t.location_of("assert true: 'never'"),
                     condition=t.boolean(True),
-                    message=t.str("never", "'never'"),
+                    message=t.str("never", literal="'never'"),
                 ),
                 body=t.boolean(False),
             ),
@@ -1564,6 +1662,56 @@ class TestAST(unittest.TestCase):
                     ),
                     body=t.id("x"),
                 ),
+            ),
+        )
+
+    def assertAstEqualByQuery(
+        self, doc: TestDocument, query: T.Query, capture: str, expected: AST
+    ):
+        captures = T.QueryCursor(query).captures(doc.root)
+        [node] = captures[capture]
+        self.assertAstEqual(AST.from_doc(doc.uri, node), expected)
+
+    def test_object_field_name(self):
+        query = T.Query(
+            get_language("jsonnet"),
+            dedent(
+                """\
+                (object
+                  (member
+                    (field (fieldname) @field_name
+                           (_) @field_value) @field))
+                """
+            ),
+        )
+
+        t = TestDocument("local x = 'f'; { [x]: 1 }")
+
+        self.assertAstEqual(
+            t.query_one(query, "field_name"),
+            DynamicFieldName(
+                t.location_of("[x]"),
+                t.id("x", nth=2),
+            ),
+        )
+
+        t = TestDocument("{ x: 1 }")
+
+        self.assertAstEqual(
+            t.query_one(query, "field_name"),
+            FixedFieldName(
+                t.location_of("x"),
+                t.id("x"),
+            ),
+        )
+
+        t = TestDocument("{ 'x': 1 }")
+
+        self.assertAstEqual(
+            t.query_one(query, "field_name"),
+            FixedFieldName(
+                t.location_of("'x'"),
+                t.str("x", literal="'x'"),
             ),
         )
 
