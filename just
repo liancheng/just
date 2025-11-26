@@ -15,7 +15,7 @@ import sys
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from enum import ReprEnum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 from textwrap import dedent
 from typing import Annotated, Any, ClassVar, Optional, Type, TypeVar, cast
@@ -696,10 +696,10 @@ class Dynamic(FieldName):
     expr: Expr
 
 
-class Visibility(bytes, ReprEnum):
-    Default = b":"
-    Hidden = b"::"
-    Forced = b":::"
+class Visibility(StrEnum):
+    Default = ":"
+    Hidden = "::"
+    Forced = ":::"
 
 
 @dataclass
@@ -720,24 +720,27 @@ class Field(AST):
             match plus_or_vis:
                 case plus if plus.text == b"+":
                     vis, value, *_ = rest
+                    assert vis.text is not None
                     return Field(
                         location=location_of(uri, node),
                         key=FieldName.from_doc(uri, key),
                         value=Expr.from_doc(uri, value),
-                        visibility=Visibility(vis.text),
+                        visibility=Visibility(vis.text.decode()),
                         inherited=True,
                     )
                 case vis:
+                    assert vis.text is not None
                     value, *_ = rest
                     return Field(
                         location=location_of(uri, node),
                         key=FieldName.from_doc(uri, key),
                         value=Expr.from_doc(uri, value),
-                        visibility=Visibility(vis.text),
+                        visibility=Visibility(vis.text.decode()),
                         inherited=False,
                     )
         else:
             key, _, params, _, vis, body, *_ = children
+            assert vis.text is not None
             return Field(
                 location=location_of(uri, node),
                 key=FieldName.from_doc(uri, key),
@@ -749,7 +752,7 @@ class Field(AST):
                     ],
                     body=Expr.from_doc(uri, body),
                 ),
-                visibility=Visibility(vis.text),
+                visibility=Visibility(vis.text.decode()),
             )
 
 
