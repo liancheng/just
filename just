@@ -10,11 +10,11 @@
 # ]
 # ///
 
+import dataclasses as D
 import logging
 import sys
 import unittest
 from contextlib import contextmanager
-import dataclasses as D
 from enum import StrEnum
 from pathlib import Path
 from textwrap import dedent
@@ -106,22 +106,15 @@ class AST:
 
         return cast(ASTType, self)
 
-    @property
-    def pretty_tree(self) -> str:
-        return PrettyNode(self).pretty_tree
+
+def escape(s: str) -> str:
+    escaped = s[0:20].translate(PrettyTree.ESCAPE_TABLE)
+    postfix = "" if len(s) <= 10 else f"[{len(s) - 10} characters]"
+    return f'"{escaped}{postfix}"'
 
 
 @D.dataclass
-class PrettyNode:
-    """A class for pretty-printed AST nodes.
-
-    A pretty-printed AST node can be one of the following:
-
-    * An `AST` object, with or without a label.
-    * A field of an `AST` object with the field name as label.
-    * An element of a list, with its index as label.
-    """
-
+class PrettyTree:
     value: Any
     label: str | None = None
 
@@ -129,13 +122,13 @@ class PrettyNode:
         {"\n": r"\n", "\t": r"\t", "\r": r"\r", '"': r"\""}
     )
 
-    def __repr__(self):
-        def escape(s: str) -> str:
-            escaped = self.value[0:10].translate(PrettyNode.ESCAPE_TABLE)
-            postfix = "" if len(s) <= 10 else f"[{len(s) - 10} characters]"
-            return f'"{escaped}{postfix}"'
-
+    @property
+    def text(self):
         match self.value:
+            case T.Node() as node if not node.is_named and node.text:
+                repr = f"{escape(node.text.decode())} [{range_of(node)}]"
+            case T.Node() as node if node.text:
+                repr = f"{node.type} [{range_of(node)}]"
             case Document() as doc:
                 repr = f"{doc.__class__.__name__} [{doc.location}]"
             case AST() as ast:
@@ -150,34 +143,42 @@ class PrettyNode:
         return repr if self.label is None else f"{self.label}={repr}"
 
     @property
-    def children(self) -> list["PrettyNode"]:
+    def children(self) -> list["PrettyTree"]:
         match self.value:
+            case T.Node() as node:
+                return [
+                    PrettyTree(node.child(i), node.field_name_for_child(i))
+                    for i in range(len(node.children))
+                ]
             case AST() as ast:
                 return [
-                    PrettyNode(getattr(ast, f.name), f.name)
+                    PrettyTree(getattr(ast, f.name), f.name)
                     for f in D.fields(ast)
                     if f.name != "location"
                 ]
             case [*elems] if (size := len(elems)) > 0:
-                return [PrettyNode(elems[i], f"[{i}]") for i in range(size)]
+                return [PrettyTree(elems[i], f"[{i}]") for i in range(size)]
             case _:
                 return []
 
-    @property
-    def pretty_tree(self):
-        def grow(buf: list[str], nodes: list[PrettyNode], branches: str = ""):
+    def __repr__(self):
+        def grow(buf: list[str], nodes: list[PrettyTree], branches: str = ""):
             for i in range(len(nodes)):
-                last = i == len(nodes) - 1
-                new_branch = ".   " if last else "|   "
-                fork = "`-- " if last else "|-- "
+                last_child = i == len(nodes) - 1
+                new_branch = ".   " if last_child else "|   "
+                fork = "`-- " if last_child else "|-- "
 
-                buf.append(f"{branches}{fork}{nodes[i]}")
+                buf.append(f"{branches}{fork}{nodes[i].text}")
                 grow(buf, nodes[i].children, branches + new_branch)
 
-        lines = [str(self)]
+        lines = [self.text]
         grow(lines, self.children)
 
         return "\n".join(lines)
+
+
+def pretty_tree(tree: AST | T.Node) -> str:
+    return str(PrettyTree(tree))
 
 
 @D.dataclass
@@ -1340,11 +1341,11 @@ class TestAST(unittest.TestCase):
     def assertAstEqual(self, tree_or_source: AST | str, expected: AST | str):
         match tree_or_source, expected:
             case AST() as tree, str():
-                self.assertMultiLineEqual(tree.pretty_tree, expected.strip())
+                self.assertMultiLineEqual(pretty_tree(tree), expected.strip())
             case AST() as tree, AST() if tree != expected:
-                self.assertAstEqual(tree, expected.pretty_tree)
+                self.assertAstEqual(tree, pretty_tree(expected))
             case str() as source, AST():
-                self.assertAstEqual(TestDocument(source).body, expected.pretty_tree)
+                self.assertAstEqual(TestDocument(source).body, pretty_tree(expected))
             case str() as source, str():
                 self.assertAstEqual(TestDocument(source).body, expected)
 
@@ -1885,6 +1886,14 @@ def tree(
             allow_dash=True,
         ),
     ],
+    tree_sitter: Annotated[
+        bool,
+        typer.Option(
+            "-t",
+            "--tree-sitter",
+            help="Print the tree-sitter tree.",
+        ),
+    ],
 ):
     if path == Path("-"):
         uri = "/dev/stdin"
@@ -1893,7 +1902,9 @@ def tree(
         uri = path.absolute().as_uri()
         source = path.read_text()
 
-    print(AST.from_doc(uri, parse(source)).pretty_tree)
+    cst = parse(source)
+    ast = AST.from_doc(uri, cst)
+    print(pretty_tree(cst if tree_sitter else ast))
 
 
 @app.command()
