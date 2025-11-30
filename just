@@ -1994,7 +1994,7 @@ def tree(
             "--tree-sitter",
             help="Print the tree-sitter tree.",
         ),
-    ],
+    ] = False,
 ):
     if path == Path("-"):
         uri = "/dev/stdin"
