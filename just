@@ -284,6 +284,7 @@ class Document(Expr):
 @D.dataclass
 class Id(Expr):
     name: str
+    is_variable: bool = True
 
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "Id":
@@ -296,6 +297,10 @@ class Id(Expr):
 
     def arg(self, value: Expr) -> "Arg":
         return Arg(merge_locations(self, value), value, self)
+
+    @property
+    def non_variable(self) -> "Id":
+        return Id(self.location, self.name, False)
 
 
 @D.dataclass
@@ -730,7 +735,7 @@ class FieldKey(AST):
             e, *_ = tail
             return DynamicKey(location, Expr.from_doc(uri, e))
         elif head.type == "id":
-            return FixedKey(location, Id.from_doc(uri, head))
+            return FixedKey(location, Id.from_doc(uri, head).non_variable)
         else:
             return FixedKey(location, Str.from_doc(uri, head))
 
@@ -873,7 +878,7 @@ class FieldAccess(Expr):
         return FieldAccess(
             location=location_of(uri, node),
             expr=Expr.from_doc(uri, expr),
-            field=Id.from_doc(uri, field),
+            field=Id.from_doc(uri, field).non_variable,
         )
 
 
@@ -1319,7 +1324,7 @@ class DocumentIndex(Visitor):
             pass
 
     def visit_id(self, e: Id):
-        if (binding := self.scope.get(e)) is not None:
+        if e.is_variable and (binding := self.scope.get(e)) is not None:
             self.new_ref(e, binding)
 
     def visit_field(self, f: Field):
@@ -1631,13 +1636,15 @@ class TestAST(unittest.TestCase):
                 |-- binds=[...]
                 |   `-- [0]=Bind [0:6-0:11]
                 |   .   |-- id=Id [0:6-0:7]
-                |   .   |   `-- name="x"
+                |   .   |   |-- name="x"
+                |   .   |   `-- is_variable=True
                 |   .   `-- value=Num [0:10-0:11]
                 |   .   .   `-- value=1.0
                 `-- body=Binary [0:13-0:18]
                 .   |-- op="+"
                 .   |-- lhs=Id [0:13-0:14]
-                .   |   `-- name="x"
+                .   |   |-- name="x"
+                .   |   `-- is_variable=True
                 .   `-- rhs=Num [0:17-0:18]
                 .   .   `-- value=2.0
                 """
@@ -2008,7 +2015,7 @@ class TestAST(unittest.TestCase):
             t.query_one(self.object_query, "field_key"),
             FixedKey(
                 t.location_of("x"),
-                t.id("x"),
+                t.id("x").non_variable,
             ),
         )
 
@@ -2029,7 +2036,7 @@ class TestAST(unittest.TestCase):
             t.query_one(self.object_query, "field"),
             Field(
                 location=t.location_of("x: 1"),
-                key=FixedKey(t.location_of("x"), t.id("x")),
+                key=FixedKey(t.location_of("x"), t.id("x").non_variable),
                 value=t.num(1),
             ),
         )
@@ -2040,7 +2047,7 @@ class TestAST(unittest.TestCase):
             t.query_one(self.object_query, "field"),
             Field(
                 location=t.location_of("x+::: 1"),
-                key=FixedKey(t.location_of("x"), t.id("x")),
+                key=FixedKey(t.location_of("x"), t.id("x").non_variable),
                 value=t.num(1),
                 visibility=Visibility.Forced,
                 inherited=True,
@@ -2053,7 +2060,7 @@ class TestAST(unittest.TestCase):
             t.query_one(self.object_query, "field"),
             Field(
                 location=t.location_of("f(p1, p2 = 0):: p1 + p2"),
-                key=FixedKey(t.location_of("f"), t.id("f")),
+                key=FixedKey(t.location_of("f"), t.id("f").non_variable),
                 value=Fn(
                     t.location_of("f(p1, p2 = 0):: p1 + p2"),
                     params=[
