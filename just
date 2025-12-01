@@ -24,6 +24,7 @@ import lsprotocol.types as L
 import tree_sitter as T
 import typer
 from pygls.lsp.server import LanguageServer
+from rich import print
 from tree_sitter_language_pack import get_language, get_parser
 
 app = typer.Typer(
@@ -115,9 +116,9 @@ ESCAPE_TABLE: dict[int, str] = str.maketrans(
 )
 
 
-def escape(s: str) -> str:
-    escaped = s[0:20].translate(ESCAPE_TABLE)
-    postfix = "" if len(s) <= 10 else f"[{len(s) - 10} characters]"
+def escape(s: str, size: int = 50) -> str:
+    escaped = s[0:size].translate(ESCAPE_TABLE)
+    postfix = "" if len(s) <= size else f"[{len(s) - size} characters]"
     return f'"{escaped}{postfix}"'
 
 
