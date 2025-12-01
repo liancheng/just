@@ -1210,7 +1210,15 @@ class Scope:
         return Scope([], parent=self)
 
 
-@D.dataclass
+@D.dataclass(frozen=True)
+class HashablePosition:
+    pos: L.Position
+
+    def __hash__(self) -> int:
+        return hash((self.pos.line, self.pos.character))
+
+
+@D.dataclass(frozen=True)
 class HashableRange:
     range: L.Range
 
@@ -1226,26 +1234,22 @@ class HashableRange:
 
 
 class DocumentIndex(Visitor):
+    inlay_hints: dict[HashablePosition, L.InlayHint] = {}
+
+    scope = Scope()
+
+    root_symbol = L.DocumentSymbol(
+        name="__root__",
+        kind=L.SymbolKind.Variable,
+        range=L.Range(L.Position(0, 0), L.Position(0, 0)),
+        selection_range=L.Range(L.Position(0, 0), L.Position(0, 0)),
+    )
+
+    breadcrumbs = [root_symbol]
+
     def __init__(self, server: "JustLanguageServer", tree: Expr) -> None:
         self.server = server
         self.tree = tree
-
-        # A dummy root document symbol acting as the parent of all top-level symbols.
-        self.root_symbol = L.DocumentSymbol(
-            name="__root__",
-            kind=L.SymbolKind.Variable,
-            range=tree.location.range,
-            selection_range=tree.location.range,
-        )
-
-        # For tracking the currently active document symbol during the tree traversal.
-        self.breadcrumbs = [self.root_symbol]
-
-        # The variable scope for tracking definitions and references.
-        self.scope = Scope()
-
-        self.inlay_hints: list[L.InlayHint] = []
-
         self.visit(tree)
 
     @property
@@ -1354,27 +1358,26 @@ class DocumentIndex(Visitor):
             label_parts.append("inherited")
 
         if len(label_parts) > 0:
-            self.inlay_hints.append(
-                L.InlayHint(
-                    position=f.key.location.range.end,
-                    label=", ".join(label_parts),
-                    kind=L.InlayHintKind.Parameter,
-                    padding_left=True,
-                    padding_right=True,
-                )
+            key_end = f.key.location.range.end
+            self.inlay_hints[HashablePosition(key_end)] = L.InlayHint(
+                position=key_end,
+                label=", ".join(label_parts),
+                kind=L.InlayHintKind.Parameter,
+                padding_left=True,
+                padding_right=True,
             )
 
     def new_ref(self, ref: Id, binding: Binding):
         uri = self.tree.location.uri
 
         def new_def_ref_hint(pos: L.Position, label: str):
-            self.inlay_hints.append(
-                L.InlayHint(
+            key = HashablePosition(pos)
+            if key not in self.inlay_hints:
+                self.inlay_hints[key] = L.InlayHint(
                     position=pos,
                     label=label,
                     kind=L.InlayHintKind.Parameter,
                 )
-            )
 
         ref_range = ref.location.range
         def_range = binding.id.location.range
@@ -1514,7 +1517,7 @@ def references(ls: JustLanguageServer, params: L.ReferenceParams):
 @server.feature(L.TEXT_DOCUMENT_INLAY_HINT)
 def inlay_hint(ls: JustLanguageServer, params: L.InlayHintParams):
     index = ls.index(params.text_document.uri)
-    return index.inlay_hints
+    return list(index.inlay_hints.values())
 
 
 class TestDocument:
