@@ -88,7 +88,7 @@ class AST:
             "ifspec": IfSpec.from_doc,
             "import": Import.from_doc,
             "importstr": Import.from_doc,
-            "indexing": Index.from_doc,
+            "indexing": Slice.from_doc,
             "local_bind": Local.from_doc,
             "named_argument": Arg.from_doc,
             "number": Num.from_doc,
@@ -878,6 +878,37 @@ class FieldAccess(Expr):
 
 
 @D.dataclass
+class Slice(Expr):
+    array: Expr
+    begin: Expr
+    end: Expr | None = None
+    step: Expr | None = None
+
+    @staticmethod
+    def from_doc(uri: str, node: T.Node) -> "Slice":
+        assert node.type == "indexing"
+        expr, begin, *rest = strip_comments(node.named_children)
+        match rest:
+            case [end, step]:
+                end = Expr.from_doc(uri, end)
+                step = Expr.from_doc(uri, step)
+            case [end]:
+                end = Expr.from_doc(uri, end)
+                step = None
+            case _:
+                end = None
+                step = None
+
+        return Slice(
+            location=location_of(uri, node),
+            array=Expr.from_doc(uri, expr),
+            begin=Expr.from_doc(uri, begin),
+            end=end,
+            step=step,
+        )
+
+
+@D.dataclass
 class If(Expr):
     condition: Expr
     consequence: Expr
@@ -935,6 +966,8 @@ class Visitor:
                 self.visit_if(e)
             case Object() as e:
                 self.visit_object(e)
+            case FieldAccess() as e:
+                self.visit_field_access(e)
 
     def visit_document(self, e: Document):
         self.visit(e.body)
@@ -1046,6 +1079,20 @@ class Visitor:
     def visit_field(self, f: Field):
         del f
 
+    def visit_field_access(self, e: FieldAccess):
+        self.visit(e.expr)
+        self.visit(e.field)
+
+    def visit_slice(self, e: Slice):
+        self.visit(e.array)
+        self.visit(e.begin)
+
+        if e.end is not None:
+            self.visit(e.end)
+
+        if e.step is not None:
+            self.visit(e.step)
+
 
 def position_of(point: T.Point) -> L.Position:
     return L.Position(point.row, point.column)
@@ -1120,41 +1167,6 @@ def parse(source: str) -> T.Node:
 class Binding:
     id: Id
     value: Expr | None = None
-
-
-@D.dataclass
-class Index(Expr):
-    array: Expr
-    begin: Expr
-    end: Expr | None = None
-    step: Expr | None = None
-
-    @staticmethod
-    def from_doc(uri: str, node: T.Node) -> "Index":
-        assert node.type == "indexing"
-        expr, begin, *rest = strip_comments(node.named_children)
-        match rest:
-            case [end, step]:
-                return Index(
-                    location=location_of(uri, node),
-                    array=Expr.from_doc(uri, expr),
-                    begin=Expr.from_doc(uri, begin),
-                    end=Expr.from_doc(uri, end),
-                    step=Expr.from_doc(uri, step),
-                )
-            case [end]:
-                return Index(
-                    location=location_of(uri, node),
-                    array=Expr.from_doc(uri, expr),
-                    begin=Expr.from_doc(uri, begin),
-                    end=Expr.from_doc(uri, end),
-                )
-            case _:
-                return Index(
-                    location=location_of(uri, node),
-                    array=Expr.from_doc(uri, expr),
-                    begin=Expr.from_doc(uri, begin),
-                )
 
 
 @D.dataclass
