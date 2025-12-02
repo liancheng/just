@@ -25,7 +25,7 @@ import lsprotocol.types as L
 import tree_sitter as T
 import typer
 from pygls.lsp.server import LanguageServer
-from rich import print
+from rich.console import Console
 from tree_sitter_language_pack import get_language, get_parser
 
 app = typer.Typer(
@@ -2161,7 +2161,7 @@ def tree(
 
     cst = parse(source)
     ast = AST.from_doc(uri, cst)
-    print(pretty_tree(cst if tree_sitter else ast))
+    Console(markup=False).print(pretty_tree(cst if tree_sitter else ast))
 
 
 @app.command()
