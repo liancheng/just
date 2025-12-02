@@ -1216,23 +1216,23 @@ class HashableRange:
 
 
 class DocumentIndex(Visitor):
-    inlay_hints: dict[HashablePosition, L.InlayHint] = {}
-
-    scope = Scope()
-
-    root_symbol = L.DocumentSymbol(
-        name="__root__",
-        kind=L.SymbolKind.Variable,
-        range=L.Range(L.Position(0, 0), L.Position(0, 0)),
-        selection_range=L.Range(L.Position(0, 0), L.Position(0, 0)),
-    )
-
-    breadcrumbs = [root_symbol]
-
     def __init__(self, server: "JustLanguageServer", tree: Expr) -> None:
         self.server = server
         self.tree = tree
+        self.inlay_hints: dict[HashablePosition, L.InlayHint] = {}
+        self.scope = Scope()
+        self.root_symbol = L.DocumentSymbol(
+            name="__root__",
+            kind=L.SymbolKind.File,
+            range=tree.location.range,
+            selection_range=tree.location.range,
+        )
+        self.breadcrumbs = [self.root_symbol]
         self.visit(tree)
+
+    @property
+    def uri(self):
+        return self.tree.location.uri
 
     @property
     def document_symbols(self):
@@ -1276,7 +1276,7 @@ class DocumentIndex(Visitor):
             selection_range=b.location.range,
         )
 
-        self.server.workspace_symbols.append(ws_symbol)
+        self.server.workspace_symbols[self.uri].append(ws_symbol)
 
         with self.parent_symbol(doc_symbol):
             with self.nested_scope():
@@ -1296,19 +1296,29 @@ class DocumentIndex(Visitor):
         #
         # The above two constraints requires us to handle parameter list processing in
         # `visit_fn` instead of `visit_param`.
-        super().visit_fn(e)
 
-    def visit_param(self, p: Param):
-        symbol = L.DocumentSymbol(
-            name=p.id.name,
-            kind=L.SymbolKind.Variable,
-            range=p.id.location.range,
-            selection_range=p.location.range,
-        )
+        with self.nested_scope():
+            param_doc_symbols = []
 
-        if p.default is not None:
-            with self.parent_symbol(symbol):
-                self.visit(p.default)
+            for p in e.params:
+                self.scope.bind(p.id, p.default)
+
+                ws_symbol, doc_symbol = self.new_symbol(
+                    p.id.name,
+                    L.SymbolKind.Variable,
+                    p.id.location,
+                    p.location.range,
+                )
+
+                self.server.workspace_symbols[self.uri].append(ws_symbol)
+                param_doc_symbols.append(doc_symbol)
+
+            for p, symbol in zip(e.params, param_doc_symbols):
+                if p.default is not None:
+                    with self.parent_symbol(symbol):
+                        self.visit(p.default)
+
+            self.visit(e.body)
 
     def visit_for_spec(self, s: ForSpec):
         self.visit(s.expr)
@@ -1350,8 +1360,6 @@ class DocumentIndex(Visitor):
             )
 
     def new_ref(self, ref: Id, binding: Binding):
-        uri = self.tree.location.uri
-
         def new_def_ref_hint(pos: L.Position, label: str):
             key = HashablePosition(pos)
             if key not in self.inlay_hints:
@@ -1364,8 +1372,8 @@ class DocumentIndex(Visitor):
         ref_range = ref.location.range
         def_range = binding.id.location.range
 
-        self.server.ref_to_defs[uri][HashableRange(ref_range)].append(binding.id)
-        self.server.def_to_refs[uri][HashableRange(def_range)].append(ref)
+        self.server.ref_to_defs[self.uri][HashableRange(ref_range)].append(binding.id)
+        self.server.def_to_refs[self.uri][HashableRange(def_range)].append(ref)
 
         new_def_ref_hint(ref_range.end, "󰁝")
         new_def_ref_hint(def_range.end, "󰁅")
@@ -1404,15 +1412,19 @@ PositionToRanges = dict[str, dict[HashableRange, list[Id]]]
 
 
 class JustLanguageServer(LanguageServer):
-    # Indexed documents
-    docs: dict[str, DocumentIndex] = {}
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Indexed documents
+        self.docs: dict[str, DocumentIndex] = {}
 
-    # TODO Use a suffix tree to make it scalable.
-    workspace_symbols: list[L.WorkspaceSymbol] = []
+        # TODO Use a suffix tree to make it scalable.
+        self.workspace_symbols: dict[str, list[L.WorkspaceSymbol]] = defaultdict(
+            list[L.WorkspaceSymbol]
+        )
 
-    # For go-to-definition and find-references
-    ref_to_defs: PositionToRanges = defaultdict(lambda: defaultdict(list[Id]))
-    def_to_refs: PositionToRanges = defaultdict(lambda: defaultdict(list[Id]))
+        # For go-to-definition and find-references
+        self.ref_to_defs: PositionToRanges = defaultdict(lambda: defaultdict(list[Id]))
+        self.def_to_refs: PositionToRanges = defaultdict(lambda: defaultdict(list[Id]))
 
     def position_to_locations(
         self, uri: str, pos: L.Position, lookup: PositionToRanges
@@ -1433,11 +1445,18 @@ class JustLanguageServer(LanguageServer):
     def references(self, uri: str, position: L.Position) -> list[L.Location]:
         return self.position_to_locations(uri, position, self.def_to_refs)
 
-    def refresh_index(self, uri: str) -> DocumentIndex:
+    def refresh_index(self, uri: str):
+        if uri in self.ref_to_defs:
+            del self.ref_to_defs[uri]
+
+        if uri in self.def_to_refs:
+            del self.def_to_refs[uri]
+
+        if uri in self.workspace_symbols:
+            del self.workspace_symbols[uri]
+
         root = parse(self.workspace.get_text_document(uri).source)
-        index = DocumentIndex(self, Expr.from_doc(uri, root))
-        self.docs[uri] = index
-        return index
+        self.docs[uri] = DocumentIndex(self, Expr.from_doc(uri, root))
 
     def index(self, uri: str) -> DocumentIndex:
         if uri not in self.docs:
@@ -1479,7 +1498,12 @@ def did_change(ls: JustLanguageServer, params: L.DidChangeTextDocumentParams):
 
 @server.feature(L.WORKSPACE_SYMBOL)
 def workspace_symbol(ls: JustLanguageServer, params: L.WorkspaceSymbolParams):
-    return [symbol for symbol in ls.workspace_symbols if params.query in symbol.name]
+    return [
+        symbol
+        for symbols in ls.workspace_symbols.values()
+        for symbol in symbols
+        if params.query in symbol.name
+    ]
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
