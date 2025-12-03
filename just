@@ -1750,6 +1750,8 @@ class TestDocument:
         self.root = parse_jsonnet(source)
         self.body = Document.from_doc(self.uri, self.root).body
 
+        # Computes the character offset of the first character in each line, used for
+        # converting line-character positions to offsets.
         self.line_offsets = [0]
         for line in self.lines[:-1]:
             self.line_offsets.append(len(line) + self.line_offsets[-1])
@@ -2390,20 +2392,27 @@ class TestWorkspace:
 
 
 def side_by_side(lhs: Text, rhs: Text) -> Text:
-    max_width = max(map(len, lhs.plain.splitlines()))
-    return Text("\n").join(
-        [
-            Text().join(
-                [
-                    lhs_line,
-                    Text(" " * (max_width - len(lhs_line))),
-                    Text(" | "),
-                    rhs_line,
-                ]
-            )
-            for lhs_line, rhs_line in zip(lhs.split(), rhs.split())
-        ]
-    )
+    lines = lhs.plain.splitlines()
+    max_width = max(map(len, lines))
+    n_rows = len(lines)
+    line_no_width = len(str(n_rows))
+    sep = Text.styled(" | ", "grey50")
+
+    ruler = Text.styled(("....:" * (max_width // 5 + 1))[:max_width], "grey50")
+    ruler = ruler + sep + ruler
+    ruler.pad_left(line_no_width + 2)
+
+    rendered = [ruler]
+
+    for lhs_line, rhs_line, n in zip(lhs.split(), rhs.split(), range(1, n_rows + 1)):
+        lhs_padding = " " * (max_width - len(lhs_line))
+        line_no = Text.styled(f"{n:>{line_no_width}}: ", "grey50")
+        rendered.append(line_no + lhs_line + lhs_padding + sep + rhs_line)
+
+    if n_rows > 3:
+        rendered.append(ruler)
+
+    return Text("\n").join(rendered)
 
 
 class TestDefRef(unittest.TestCase):
@@ -2434,12 +2443,7 @@ class TestDefRef(unittest.TestCase):
 
         with console.capture() as capture:
             console.print()
-            console.print(
-                side_by_side(
-                    Text.styled("Expected\n", "black on yellow") + expected_vis,
-                    Text.styled("Obtained\n", "black on yellow") + obtained_vis,
-                )
-            )
+            console.print(side_by_side(expected_vis, obtained_vis))
 
         self.assertSequenceEqual(obtained, expected, msg=capture.get())
 
