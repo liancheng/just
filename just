@@ -431,14 +431,6 @@ class Binary(Expr):
             rhs=Expr.from_doc(uri, rhs),
         )
 
-    @property
-    def is_object_composition(self) -> bool:
-        match self:
-            case Binary(_, Operator.Plus, _, Object()):
-                return True
-            case _:
-                return False
-
 
 @D.dataclass
 class Bind(AST):
@@ -1375,8 +1367,8 @@ class DocumentIndex(Visitor):
                     for value in maybe(binding.value)
                     for scope in maybe(self.find_object_scope(value, binding.scope))
                 )
-            case Binary(_, _, _, Object() as rhs) as b if b.is_object_composition:
-                return rhs.self_scope
+            case Binary(_, _, _, rhs):
+                return self.find_object_scope(rhs, self.current_scope)
             case _:
                 return None
 
@@ -1504,11 +1496,8 @@ class DocumentIndex(Visitor):
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
 
-        if e.is_object_composition and isinstance(e.rhs, Object):
-            lhs_scope = self.find_object_scope(e.lhs, self.current_scope)
-            with self.super_scope(lhs_scope):
-                self.visit(e.rhs)
-        else:
+        lhs_scope = self.find_object_scope(e.lhs, self.current_scope)
+        with self.super_scope(lhs_scope):
             self.visit(e.rhs)
 
 
@@ -2535,7 +2524,6 @@ class TestDefRef(unittest.TestCase):
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
-    @unittest.skip("Feature not implemented")
     def test_var_var_composition(self):
         t = TestDocument(
             dedent(
@@ -2550,7 +2538,7 @@ class TestDefRef(unittest.TestCase):
         self.checkDefRefs(
             TestWorkspace(t),
             def_location=t.location_of("f", line=2),
-            ref_locations=[t.location_of("f", line=3)],
+            ref_locations=[t.location_of("f", line=2)],
         )
 
 
