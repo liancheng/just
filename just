@@ -1562,14 +1562,34 @@ class WorkspaceIndex:
     def references(self, uri: str, position: L.Position) -> list[L.Location]:
         return self.find_related_locations(uri, position, self.def_to_refs)
 
-    def refresh_index(self, uri: str, source: str):
+    def sync(self, uri: str, source: str, strict_on_error: bool = False):
+        # When a document is being edited, parsing likely would fail. `strict_on_error`
+        # determines the behavior on parsing errors:
+        #
+        #   * When `True` (used in tests):
+        #       * Always cleans up the old doc ahead of time.
+        #       * Re-raises parsing errors, if any.
+        #   * When `False`:
+        #       * Ignores parsing errors
+        #       * Does NOT cleanup the old doc on parsing errors.
+        #
+        # The latter is desired when used in editors to avoid glitches.
+
+        if strict_on_error:
+            self.cleanup(uri)
+
         try:
             cst = parse_jsonnet(source)
             tree = Expr.from_doc(uri, cst)
         except Exception:
-            return
+            if strict_on_error:
+                raise
+            else:
+                return
 
-        self.cleanup(uri)
+        if not strict_on_error:
+            self.cleanup(uri)
+
         self.docs[uri] = DocumentIndex(self, tree)
 
     def cleanup_location_map(self, uri: str, map: LocationMap) -> LocationMap:
@@ -1599,7 +1619,7 @@ class WorkspaceIndex:
 
     def doc_index(self, uri: str, source: str) -> DocumentIndex:
         if uri not in self.docs:
-            self.refresh_index(uri, source)
+            self.sync(uri, source)
         return self.docs[uri]
 
 
@@ -1633,14 +1653,14 @@ def initialize(_: L.InitializeParams):
 @server.feature(L.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    ls.workspace_index.refresh_index(doc.uri, doc.source)
+    ls.workspace_index.sync(doc.uri, doc.source)
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: JustLanguageServer, params: L.DidChangeTextDocumentParams):
     # TODO: Patch the AST incrementally.
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    ls.workspace_index.refresh_index(doc.uri, doc.source)
+    ls.workspace_index.sync(doc.uri, doc.source)
 
 
 @server.feature(L.WORKSPACE_SYMBOL)
@@ -2352,7 +2372,8 @@ class TestWorkspace:
     def __init__(self, docs: list[TestDocument]) -> None:
         self.workspace_index = WorkspaceIndex()
         for doc in docs:
-            self.workspace_index.doc_index(doc.uri, doc.source)
+            assert doc.uri not in self.workspace_index.docs
+            self.workspace_index.sync(doc.uri, doc.source, strict_on_error=True)
 
     @__init__.register(TestDocument)
     def _(self, doc) -> None:
@@ -2400,6 +2421,64 @@ class TestDefRef(unittest.TestCase):
         self.assertSequenceEqual(
             w.workspace_index.references(t.uri, t.start_of("g")),
             [t.location_of("g", nth=2)],
+        )
+
+    def test_obj_obj_composition(self):
+        t = TestDocument("({ f: 1 } { f: 2 }).f")
+        w = TestWorkspace(t)
+
+        self.assertSequenceEqual(
+            w.workspace_index.definitions(t.uri, t.start_of("f", nth=3)),
+            [t.location_of("f", nth=2)],
+        )
+
+        self.assertSequenceEqual(
+            w.workspace_index.references(t.uri, t.start_of("f", nth=2)),
+            [t.location_of("f", nth=3)],
+        )
+
+    def test_var_obj_composition(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local o = { f: 1 };
+                (o + { f: 2 }).f
+                """
+            )
+        )
+        w = TestWorkspace(t)
+
+        self.assertSequenceEqual(
+            w.workspace_index.definitions(t.uri, t.start_of("f", line=1)),
+            [],
+        )
+
+        self.assertSequenceEqual(
+            w.workspace_index.definitions(t.uri, t.start_of("f", line=2, nth=2)),
+            [t.location_of("f", line=2)],
+        )
+
+        self.assertSequenceEqual(
+            w.workspace_index.references(t.uri, t.start_of("f", line=2)),
+            [t.location_of("f", line=2, nth=2)],
+        )
+
+    @unittest.skip("Feature not implemented")
+    def test_var_var_composition(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local o1 = { f: 1 };
+                local o2 = { f: 2 };
+                (o1 + o2).f
+                """
+            )
+        )
+        w = TestWorkspace(t)
+
+        self.assertSequenceEqual(
+            w.workspace_index.definitions(t.uri, t.start_of("f", line=3)),
+            [t.location_of("f", line=2)],
         )
 
 
