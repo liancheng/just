@@ -1267,13 +1267,31 @@ class DocumentIndex(Visitor):
     def document_symbols(self):
         return self.root_symbol.children
 
-    def new_symbol(
+    def add_workspace_symbol(self, symbol: L.WorkspaceSymbol):
+        self.workspace_index.workspace_symbols[self.uri].append(symbol)
+
+    def add_document_symbol(self, symbol: L.DocumentSymbol):
+        parent = self.breadcrumbs[-1]
+
+        match parent.children:
+            case list():
+                parent.children.append(symbol)
+            case None:
+                parent.children = [symbol]
+
+    def add_symbol(
         self,
         name: str,
         kind: L.SymbolKind,
         location: L.Location,
         selection_range: L.Range | None = None,
     ) -> tuple[L.WorkspaceSymbol, L.DocumentSymbol]:
+        ws_symbol = L.WorkspaceSymbol(
+            location=location,
+            name=name,
+            kind=kind,
+        )
+
         doc_symbol = L.DocumentSymbol(
             name=name,
             kind=kind,
@@ -1281,11 +1299,8 @@ class DocumentIndex(Visitor):
             selection_range=selection_range or location.range,
         )
 
-        ws_symbol = L.WorkspaceSymbol(
-            location=location,
-            name=name,
-            kind=kind,
-        )
+        self.add_workspace_symbol(ws_symbol)
+        self.add_document_symbol(doc_symbol)
 
         return ws_symbol, doc_symbol
 
@@ -1306,16 +1321,7 @@ class DocumentIndex(Visitor):
 
     @contextmanager
     def parent_symbol(self, symbol: L.DocumentSymbol):
-        parent = self.breadcrumbs[-1]
-
-        match parent.children:
-            case list():
-                parent.children.append(symbol)
-            case None:
-                parent.children = [symbol]
-
         self.breadcrumbs.append(symbol)
-
         try:
             yield symbol
         finally:
@@ -1381,14 +1387,12 @@ class DocumentIndex(Visitor):
             case _:
                 kind = L.SymbolKind.Variable
 
-        ws_symbol, doc_symbol = self.new_symbol(
+        _, doc_symbol = self.add_symbol(
             name=b.id.name,
             kind=kind,
             location=b.id.location,
             selection_range=b.location.range,
         )
-
-        self.workspace_index.workspace_symbols[self.uri].append(ws_symbol)
 
         with self.parent_symbol(doc_symbol):
             with self.nested_scope():
@@ -1410,14 +1414,12 @@ class DocumentIndex(Visitor):
                 self.current_scope.bind(p.id.name, p.id.location, p.default)
 
             for p in e.params:
-                ws_symbol, doc_symbol = self.new_symbol(
+                _, doc_symbol = self.add_symbol(
                     p.id.name,
                     L.SymbolKind.Variable,
                     p.id.location,
                     p.location.range,
                 )
-
-                self.workspace_index.workspace_symbols[self.uri].append(ws_symbol)
 
                 if p.default is not None:
                     with self.parent_symbol(doc_symbol):
@@ -1809,7 +1811,7 @@ class TestDocument:
     def arg(self, value: Expr) -> Arg:
         return Arg(value.location, value)
 
-    def render_locations(
+    def highlight(
         self,
         locations: list[L.Location],
         style: str,
@@ -1827,13 +1829,13 @@ class TestDocument:
         n_lines = len(lines)
         max_width = max(map(len, lines))
         line_no_width = len(str(n_lines))
-        ruler = Text.styled(("''''|" * (max_width // 5 + 1))[:max_width], "grey50")
-        ruler.pad_left(line_no_width + 2)
+        ruler = Text.styled(("|''''" * (max_width // 5 + 1))[: max_width + 1], "grey50")
+        ruler.pad_left(line_no_width + 1)
 
         rendered = [ruler]
 
         for i, line in enumerate(text.split()):
-            line_no = Text.styled(f"{i + 1:>{line_no_width}}: ", "grey50")
+            line_no = Text.styled(f"{i + 1:>{line_no_width}} |", "grey50")
             rendered.append(line_no + line)
 
         if n_lines > 5:
@@ -2421,7 +2423,7 @@ def side_by_side(lhs: Text, rhs: Text) -> Text:
     shorter.extend([empty] * abs(len(lhs_lines) - len(rhs_lines)))
 
     max_width = max(map(len, lhs.plain.splitlines()))
-    sep = Text.styled(" | ", "grey50")
+    sep = Text.styled(" : ", "grey50")
 
     return Text("\n").join(
         [
@@ -2447,8 +2449,8 @@ class TestDefRef(unittest.TestCase):
 
         with console.capture() as capture:
             message = side_by_side(
-                header("Obtained") + doc.render_locations(obtained, "black on red"),
-                header("Expected") + doc.render_locations(expected, "black on green"),
+                header("Obtained") + doc.highlight(obtained, "black on red"),
+                header("Expected") + doc.highlight(expected, "black on green"),
             )
 
             console.print("\n")
@@ -2471,7 +2473,7 @@ class TestDefRef(unittest.TestCase):
         clue = Text("\n").join(
             [
                 Text("Checking symbol reference(s):"),
-                doc.render_locations([def_location], "black on yellow"),
+                doc.highlight([def_location], "black on yellow"),
                 Text(""),
             ]
         )
@@ -2490,7 +2492,7 @@ class TestDefRef(unittest.TestCase):
             clue = Text("\n").join(
                 [
                     Text("Checking symbol definition:"),
-                    doc.render_locations([location], "black on yellow"),
+                    doc.highlight([location], "black on yellow"),
                     Text(""),
                 ]
             )
