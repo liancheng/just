@@ -1507,7 +1507,9 @@ LocationMap = dict[HashableLocation, list[L.Location]]
 
 
 class WorkspaceIndex:
-    def __init__(self):
+    def __init__(self, root_uri: str):
+        self.root_uri = Path(root_uri)
+
         # Indexed documents
         self.docs: dict[str, DocumentIndex] = {}
 
@@ -1616,16 +1618,21 @@ class WorkspaceIndex:
 
 
 class JustLanguageServer(LanguageServer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.workspace_index = WorkspaceIndex()
+    def set_workspace_root(self, root_path: str, root_uri: str):
+        self.workspace.add_folder(L.WorkspaceFolder(name=root_path, uri=root_uri))
+        self.workspace_index = WorkspaceIndex(root_uri)
 
 
 server = JustLanguageServer("just", "v0.1")
 
 
 @server.feature(L.INITIALIZE)
-def initialize(_: L.InitializeParams):
+def initialize(ls: JustLanguageServer, params: L.InitializeParams):
+    for root_path in maybe(params.root_path):
+        for root_uri in maybe(params.root_uri):
+            log.info("Workspace root: %s, %s", root_path, root_uri)
+            ls.set_workspace_root(root_path, root_uri)
+
     return L.InitializeResult(
         capabilities=L.ServerCapabilities(
             definition_provider=True,
@@ -2402,16 +2409,17 @@ class TestAST(unittest.TestCase):
 
 class TestWorkspace:
     @singledispatchmethod
-    def __init__(self, docs: list[TestDocument]) -> None:
+    def __init__(self, docs: list[TestDocument], root_uri: str) -> None:
         self.docs = {doc.uri: doc for doc in docs}
-        self.workspace_index = WorkspaceIndex()
+        self.workspace_index = WorkspaceIndex(root_uri)
         for doc in docs:
             assert doc.uri not in self.workspace_index.docs
             self.workspace_index.sync(doc.uri, doc.source, strict_on_error=True)
 
     @__init__.register(TestDocument)
-    def _(self, doc) -> None:
-        self.__init__([doc])
+    def _(self, doc: TestDocument) -> None:
+        root_uri = Path(doc.uri).absolute().parent.as_uri()
+        self.__init__([doc], root_uri)
 
 
 def side_by_side(lhs: Text, rhs: Text) -> Text:
