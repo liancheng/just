@@ -2438,6 +2438,7 @@ class TestDefRef(unittest.TestCase):
         doc: TestDocument,
         obtained: list[L.Location],
         expected: list[L.Location],
+        clue: Text | None = None,
     ):
         console = Console()
 
@@ -2445,14 +2446,17 @@ class TestDefRef(unittest.TestCase):
             return Text.styled(title + "\n", "black on yellow")
 
         with console.capture() as capture:
-            console.print()
-            console.print(
-                side_by_side(
-                    header("Obtained") + doc.render_locations(obtained, "black on red"),
-                    header("Expected")
-                    + doc.render_locations(expected, "black on green"),
-                )
+            message = side_by_side(
+                header("Obtained") + doc.render_locations(obtained, "black on red"),
+                header("Expected") + doc.render_locations(expected, "black on green"),
             )
+
+            console.print("\n")
+
+            if clue is not None:
+                console.print(clue)
+
+            console.print(message)
 
         self.assertSequenceEqual(obtained, expected, msg=capture.get())
 
@@ -2464,6 +2468,14 @@ class TestDefRef(unittest.TestCase):
     ):
         doc = workspace.docs[def_location.uri]
 
+        clue = Text("\n").join(
+            [
+                Text("Checking symbol reference(s):"),
+                doc.render_locations([def_location], "black on yellow"),
+                Text(""),
+            ]
+        )
+
         self.assertLocationsEqual(
             doc,
             workspace.workspace_index.references(
@@ -2471,9 +2483,18 @@ class TestDefRef(unittest.TestCase):
                 def_location.range.start,
             ),
             ref_locations,
+            clue,
         )
 
         for location in ref_locations:
+            clue = Text("\n").join(
+                [
+                    Text("Checking symbol definition:"),
+                    doc.render_locations([location], "black on yellow"),
+                    Text(""),
+                ]
+            )
+
             self.assertLocationsEqual(
                 doc,
                 workspace.workspace_index.definitions(
@@ -2481,6 +2502,7 @@ class TestDefRef(unittest.TestCase):
                     location.range.start,
                 ),
                 [def_location],
+                clue,
             )
 
     def test_local_bind(self):
@@ -2534,13 +2556,23 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace(t),
-            def_location=t.location_of("f"),
-            ref_locations=[],
+            def_location=t.location_of("f", line=2),
+            ref_locations=[t.location_of("f", line=2, nth=2)],
+        )
+
+    def test_obj_var_composition(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local o = { f: 1 };
+                ({ f: 2 } + o).f
+                """
+            )
         )
 
         self.checkDefRefs(
             TestWorkspace(t),
-            def_location=t.location_of("f", line=2),
+            def_location=t.location_of("f"),
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
