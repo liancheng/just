@@ -1303,20 +1303,28 @@ class DocumentIndex(Visitor):
 
         return ws_symbol, doc_symbol
 
-    def add_reference(self, ref: Id, binding: Binding):
-        _, refs = self.workspace_index.add_reference(ref, binding)
+    def add_id_reference(self, ref: Expr, binding: Binding):
+        _, refs = self.workspace_index.add_reference(ref.location, binding.location)
 
-        def add_hint(pos: L.Position, label: str):
-            key = HashablePosition(pos)
-            self.inlay_hints[key] = L.InlayHint(
-                position=pos,
-                label=label,
+        self.add_hint(
+            L.InlayHint(
+                position=ref.location.range.end,
+                label="󰁝",
                 kind=L.InlayHintKind.Parameter,
             )
+        )
 
         # Shows the # of references.
-        add_hint(binding.location.range.end, f"󰁅{len(refs)}")
-        add_hint(ref.location.range.end, "󰁝")
+        self.add_hint(
+            L.InlayHint(
+                position=binding.location.range.end,
+                label=f"󰁅{len(refs)}",
+                kind=L.InlayHintKind.Parameter,
+            )
+        )
+
+    def add_hint(self, hint: L.InlayHint):
+        self.inlay_hints[HashablePosition(hint.position)] = hint
 
     @contextmanager
     def parent_symbol(self, symbol: L.DocumentSymbol):
@@ -1441,7 +1449,7 @@ class DocumentIndex(Visitor):
 
     def visit_id(self, e: Id):
         if e.is_variable and (binding := self.current_scope.get(e)) is not None:
-            self.add_reference(e, binding)
+            self.add_id_reference(e, binding)
 
     def visit_field(self, e: Object, f: Field):
         assert e.self_scope is not None
@@ -1465,22 +1473,42 @@ class DocumentIndex(Visitor):
             label_parts.append("inherited")
 
         if len(label_parts) > 0:
-            key_end = f.key.location.range.end
-            self.inlay_hints[HashablePosition(key_end)] = L.InlayHint(
-                position=key_end,
-                label=", ".join(label_parts),
-                kind=L.InlayHintKind.Parameter,
-                padding_left=True,
-                padding_right=True,
+            self.add_hint(
+                L.InlayHint(
+                    position=f.key.location.range.end,
+                    label=", ".join(label_parts),
+                    kind=L.InlayHintKind.Parameter,
+                    padding_left=True,
+                    padding_right=True,
+                )
             )
 
     def visit_import(self, e: Import):
-        pos = e.path.location.range.end
-        self.inlay_hints[HashablePosition(pos)] = L.InlayHint(
-            position=pos,
-            label="",
-            kind=L.InlayHintKind.Parameter,
+        self.add_symbol(
+            name=e.path.raw,
+            kind=L.SymbolKind.File,
+            location=e.path.location,
+            selection_range=e.location.range,
         )
+
+        workspace_root = Path.from_uri(self.workspace_index.root_uri)
+        importee_path = workspace_root.joinpath(e.path.raw).absolute()
+
+        if importee_path.exists() and importee_path.is_file():
+            index = self.workspace_index.get_or_sync(
+                uri=importee_path.as_uri(),
+                source=importee_path.read_text(encoding="utf-8"),
+            )
+
+            self.add_hint(
+                L.InlayHint(
+                    position=e.path.location.range.end,
+                    label="",
+                    kind=L.InlayHintKind.Parameter,
+                )
+            )
+
+            self.workspace_index.add_reference(e.path.location, index.tree.location)
 
     def visit_object(self, e: Object):
         e.self_scope = Scope(parent=self.current_super)
@@ -1492,7 +1520,7 @@ class DocumentIndex(Visitor):
 
         for scope in maybe(self.find_object_scope(e.obj, self.current_scope)):
             for binding in maybe(scope.get(e.field)):
-                self.add_reference(e.field, binding)
+                self.add_id_reference(e.field, binding)
 
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
@@ -1536,11 +1564,8 @@ class WorkspaceIndex:
         )
 
     def add_reference(
-        self, ref: Id, binding: Binding
+        self, ref_location: L.Location, def_location: L.Location
     ) -> tuple[list[L.Location], list[L.Location]]:
-        ref_location = ref.location
-        def_location = binding.location
-
         defs = self.ref_to_defs[HashableLocation(ref_location)]
         refs = self.def_to_refs[HashableLocation(def_location)]
 
@@ -1610,7 +1635,7 @@ class WorkspaceIndex:
         if uri in self.docs:
             del self.docs[uri]
 
-    def doc_index(self, uri: str, source: str) -> DocumentIndex:
+    def get_or_sync(self, uri: str, source: str) -> DocumentIndex:
         if uri not in self.docs:
             self.sync(uri, source)
         return self.docs[uri]
@@ -1634,7 +1659,7 @@ def initialize(ls: JustLanguageServer, params: L.InitializeParams):
         for root_uri in maybe(params.root_uri):
             log.info("Discovered workspace root: %s, %s", root_path, root_uri)
 
-            root = Path(root_uri).absolute()
+            root = Path.from_uri(root_uri).absolute()
             assert root.as_posix() == Path(root_path).absolute().as_posix()
 
             ls.set_workspace_root(root.as_posix(), root.as_uri())
@@ -1662,7 +1687,7 @@ def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
     # If the workspace root is not yet discovered, set the root as the parent folder of
     # the first document opened.
     if len(ls.workspace.folders) == 0:
-        root = Path(doc.uri).absolute().parent
+        root = Path.from_uri(doc.uri).absolute().parent
         ls.set_workspace_root(root.as_posix(), root.as_uri())
 
     ls.workspace_index.sync(doc.uri, doc.text)
@@ -1688,7 +1713,7 @@ def workspace_symbol(ls: JustLanguageServer, params: L.WorkspaceSymbolParams):
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
 def document_symbol(ls: JustLanguageServer, params: L.DocumentColorParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    return ls.workspace_index.doc_index(doc.uri, doc.source).document_symbols
+    return ls.workspace_index.get_or_sync(doc.uri, doc.source).document_symbols
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
@@ -1704,7 +1729,7 @@ def references(ls: JustLanguageServer, params: L.ReferenceParams):
 @server.feature(L.TEXT_DOCUMENT_INLAY_HINT)
 def inlay_hint(ls: JustLanguageServer, params: L.InlayHintParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    doc_index = ls.workspace_index.doc_index(doc.uri, doc.source)
+    doc_index = ls.workspace_index.get_or_sync(doc.uri, doc.source)
     return list(doc_index.inlay_hints.values())
 
 
@@ -2426,7 +2451,7 @@ class TestWorkspace:
 
     @staticmethod
     def single_doc(doc: TestDocument) -> "TestWorkspace":
-        root_uri = Path(doc.uri).absolute().parent.as_uri()
+        root_uri = Path.from_uri(doc.uri).absolute().parent.as_uri()
         return TestWorkspace(root_uri, [doc])
 
 
