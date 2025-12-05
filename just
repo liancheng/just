@@ -129,6 +129,10 @@ class AST:
 
         return cast(ASTType, self)
 
+    @property
+    def pretty_tree(self) -> str:
+        return str(PrettyAST(self))
+
 
 ESCAPE_TABLE: dict[int, str] = str.maketrans(
     {"\n": r"\n", "\t": r"\t", "\r": r"\r", '"': r"\""}
@@ -172,11 +176,11 @@ class PrettyTree:
 class PrettyAST(PrettyTree):
     """A class for pretty-printing a Jsonnet AST."""
 
-    value: Any
+    node: Any
     label: str | None = None
 
     def node_text(self) -> str:
-        match self.value:
+        match self.node:
             case Document() as doc:
                 # For the top-level `Document` node, prints the full location with URI.
                 repr = f"{doc.__class__.__name__} [{doc.location}]"
@@ -189,16 +193,16 @@ class PrettyAST(PrettyTree):
                 repr = "[...]"
             case str():
                 # Escapes (and truncates) strings, which can potentially be multi-line.
-                repr = escape(self.value)
+                repr = escape(self.node)
             case _:
                 # Falls back to `__str__` for everything else.
-                repr = str(self.value)
+                repr = str(self.node)
 
         # Prepends the label, if any.
         return repr if self.label is None else f"{self.label}={repr}"
 
     def children(self) -> list["PrettyTree"]:
-        match self.value:
+        match self.node:
             case AST() as ast:
                 return [
                     PrettyAST(getattr(ast, f.name), f.name)
@@ -239,12 +243,44 @@ class PrettyCST(PrettyTree):
         return super().__repr__()
 
 
-def pretty_tree(tree: AST | T.Node) -> str:
-    match tree:
-        case AST():
-            return str(PrettyAST(tree))
-        case T.Node():
-            return str(PrettyCST(tree))
+@D.dataclass
+class PrettyScope(PrettyTree):
+    """A class for pretty-printing a scope."""
+
+    node: Any
+    label: str | None = None
+
+    def node_text(self) -> str:
+        match self.node:
+            case Scope():
+                repr = "Scope"
+            case Binding(_, name, _, None):
+                repr = name
+            case Binding(_, name, _, value):
+                repr = f'"{name}" <- {value.__class__.__name__}'
+            case []:
+                repr = "[]"
+            case list():
+                repr = "[...]"
+            case _:
+                repr = str(self.node)
+
+        return repr if self.label is None else f"{self.label}={repr}"
+
+    def children(self) -> list["PrettyTree"]:
+        match self.node:
+            case Scope(bindings, _, children):
+                return [
+                    PrettyScope(bindings, "bindings"),
+                    PrettyScope(children, "children"),
+                ]
+            case list() as array:
+                return [PrettyScope(value, f"[{i}]") for i, value in enumerate(array)]
+            case _:
+                return []
+
+    def __repr__(self):
+        return super().__repr__()
 
 
 @D.dataclass
@@ -1203,6 +1239,7 @@ class Binding:
 class Scope:
     bindings: list[Binding] = D.field(default_factory=list)
     parent: "Scope | None" = None
+    children: list["Scope"] = D.field(default_factory=list)
 
     def bind(self, name: str, location: L.Location, value: Expr | None = None):
         self.bindings.insert(0, Binding(self, name, location, value))
@@ -1214,7 +1251,13 @@ class Scope:
         )
 
     def nest(self) -> "Scope":
-        return Scope([], parent=self)
+        child = Scope([], parent=self)
+        self.children.append(child)
+        return child
+
+    @property
+    def pretty_tree(self) -> str:
+        return str(PrettyScope(self))
 
 
 @D.dataclass(frozen=True)
@@ -1361,29 +1404,46 @@ class DocumentIndex(Visitor):
         finally:
             self.current_self = prev
 
-    def find_object_scope(self, e: Expr, scope: Scope) -> Scope | None:
+    def find_scope(self, e: Expr, scope: Scope) -> Scope | None:
+        log.info("find_scope:\n%s\n%s", e.pretty_tree, scope.pretty_tree)
+
         match e:
             case Object() as obj if obj.self_scope is not None:
                 return obj.self_scope
             case Id() as id:
                 return head_or_none(
-                    scope
+                    found
                     for binding in maybe(scope.get(id))
                     for value in maybe(binding.value)
-                    for scope in maybe(self.find_object_scope(value, binding.scope))
+                    for found in maybe(self.find_scope(value, binding.scope))
                 )
             case FieldAccess() as f:
                 return head_or_none(
-                    scope
-                    for parent_scope in maybe(self.find_object_scope(f.obj, scope))
+                    found
+                    for parent_scope in maybe(self.find_scope(f.obj, scope))
                     for binding in maybe(parent_scope.get(f.field))
                     for value in maybe(binding.value)
-                    for scope in maybe(self.find_object_scope(value, binding.scope))
+                    for found in maybe(self.find_scope(value, binding.scope))
                 )
             case Binary(_, _, _, rhs):
-                return self.find_object_scope(rhs, self.current_scope)
+                return self.find_scope(rhs, self.current_scope)
+            case Import(_, "import", path):
+                return head_or_none(
+                    found
+                    for index in maybe(self.importee_index(path.raw))
+                    for found in maybe(self.find_scope(index.tree, index.current_scope))
+                )
+            case Local(_, _, body):
+                return self.find_scope(body, scope)
             case _:
                 return None
+
+    def visit_local(self, e: Local):
+        for b in e.binds:
+            self.visit_bind(b)
+
+        with self.nested_scope():
+            self.visit(e.body)
 
     def visit_bind(self, b: Bind):
         self.current_scope.bind(b.id.name, b.id.location, b.value)
@@ -1483,6 +1543,20 @@ class DocumentIndex(Visitor):
                 )
             )
 
+    def resolve_importee_path(self, raw_path: str) -> Path | None:
+        root = Path.from_uri(self.workspace_index.root_uri)
+        path = root.joinpath(raw_path).absolute()
+        return path if path.exists() and path.is_file() else None
+
+    def importee_index(self, raw_path: str) -> "DocumentIndex | None":
+        for path in maybe(self.resolve_importee_path(raw_path)):
+            return self.workspace_index.get_or_sync(
+                uri=path.as_uri(),
+                source=path.read_text(encoding="utf-8"),
+            )
+
+        return None
+
     def visit_import(self, e: Import):
         self.add_symbol(
             name=e.path.raw,
@@ -1491,10 +1565,7 @@ class DocumentIndex(Visitor):
             selection_range=e.location.range,
         )
 
-        workspace_root = Path.from_uri(self.workspace_index.root_uri)
-        importee_path = workspace_root.joinpath(e.path.raw).absolute()
-
-        if importee_path.exists() and importee_path.is_file():
+        for importee_path in maybe(self.resolve_importee_path(e.path.raw)):
             index = self.workspace_index.get_or_sync(
                 uri=importee_path.as_uri(),
                 source=importee_path.read_text(encoding="utf-8"),
@@ -1518,14 +1589,14 @@ class DocumentIndex(Visitor):
     def visit_field_access(self, e: FieldAccess):
         self.visit(e.obj)
 
-        for scope in maybe(self.find_object_scope(e.obj, self.current_scope)):
+        for scope in maybe(self.find_scope(e.obj, self.current_scope)):
             for binding in maybe(scope.get(e.field)):
                 self.add_id_reference(e.field, binding)
 
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
 
-        lhs_scope = self.find_object_scope(e.lhs, self.current_scope)
+        lhs_scope = self.find_scope(e.lhs, self.current_scope)
         with self.super_scope(lhs_scope):
             self.visit(e.rhs)
 
@@ -1770,7 +1841,9 @@ def tree(
 
     cst = parse_jsonnet(source)
     ast = AST.from_doc(uri, cst)
-    Console(markup=False).print(pretty_tree(cst if tree_sitter else ast))
+    tree = PrettyCST(cst) if tree_sitter else PrettyAST(ast)
+
+    Console(markup=False).print(tree)
 
 
 @app.command()
@@ -1873,16 +1946,19 @@ class TestDocument:
         ruler = Text.styled(("|''''" * (max_width // 5 + 1))[: max_width + 1], "grey50")
         ruler.pad_left(line_no_width + 1)
 
-        rendered = [ruler]
+        rendered_lines = [
+            Text.styled(self.uri, "grey50"),
+            ruler,
+        ]
 
         for i, line in enumerate(text.split()):
             line_no = Text.styled(f"{i + 1:>{line_no_width}} |", "grey50")
-            rendered.append(line_no + line)
+            rendered_lines.append(line_no + line)
 
         if n_lines > 5:
-            rendered.append(ruler)
+            rendered_lines.append(ruler)
 
-        return Text("\n").join(rendered)
+        return Text("\n").join(rendered_lines)
 
 
 class TestAST(unittest.TestCase):
@@ -1893,11 +1969,11 @@ class TestAST(unittest.TestCase):
     def assertAstEqual(self, tree_or_source: AST | str, expected: AST | str):
         match tree_or_source, expected:
             case AST() as tree, str():
-                self.assertMultiLineEqual(pretty_tree(tree), expected.strip())
+                self.assertMultiLineEqual(tree.pretty_tree, expected.strip())
             case AST() as tree, AST() if tree != expected:
-                self.assertAstEqual(tree, pretty_tree(expected))
+                self.assertAstEqual(tree, expected.pretty_tree)
             case str() as source, AST():
-                self.assertAstEqual(TestDocument(source).body, pretty_tree(expected))
+                self.assertAstEqual(TestDocument(source).body, expected.pretty_tree)
             case str() as source, str():
                 self.assertAstEqual(TestDocument(source).body, expected)
 
@@ -2444,10 +2520,10 @@ class TestAST(unittest.TestCase):
 class TestWorkspace:
     def __init__(self, root_uri: str, docs: list[TestDocument]) -> None:
         self.docs = {doc.uri: doc for doc in docs}
-        self.workspace_index = WorkspaceIndex(root_uri)
+        self.index = WorkspaceIndex(root_uri)
         for doc in docs:
-            assert doc.uri not in self.workspace_index.docs
-            self.workspace_index.sync(doc.uri, doc.source, strict_on_error=True)
+            assert doc.uri not in self.index.docs
+            self.index.sync(doc.uri, doc.source, strict_on_error=True)
 
     @staticmethod
     def single_doc(doc: TestDocument) -> "TestWorkspace":
@@ -2478,28 +2554,49 @@ def side_by_side(lhs: Text, rhs: Text) -> Text:
 class TestDefRef(unittest.TestCase):
     def assertLocationsEqual(
         self,
-        doc: TestDocument,
+        docs: TestDocument | Iterable[TestDocument],
         obtained: list[L.Location],
         expected: list[L.Location],
         clue: Text | None = None,
     ):
-        console = Console()
+        match docs:
+            case TestDocument() as doc:
+                docs = [doc]
+            case _:
+                docs = list(docs)
+
+        def sort_key(loc: L.Location):
+            return (loc.uri, loc.range.start, loc.range.end)
+
+        obtained.sort(key=sort_key)
+        expected.sort(key=sort_key)
+
+        def highlight(locations: list[L.Location], style: str) -> Text:
+            return Text("\n" * 2).join(
+                [
+                    doc.highlight(ranges, style)
+                    for uri, group in groupby(locations, lambda loc: loc.uri)
+                    if (doc := next(d for d in docs if d.uri == uri)) is not None
+                    if (ranges := list(location.range for location in group))
+                ]
+            )
 
         def header(title: str) -> Text:
             return Text.styled(title + "\n", "black on yellow")
 
+        console = Console()
+
         with console.capture() as capture:
+            from itertools import groupby
+
             console.print("\n")
 
             if clue is not None:
                 console.print(clue)
 
-            obtained_ranges = [loc.range for loc in obtained]
-            expected_ranges = [loc.range for loc in expected]
-
             message = side_by_side(
-                header("Obtained") + doc.highlight(obtained_ranges, "black on red"),
-                header("Expected") + doc.highlight(expected_ranges, "black on green"),
+                header("Expected") + highlight(expected, "black on green"),
+                header("Obtained") + highlight(obtained, "black on red"),
             )
 
             console.print(message)
@@ -2512,19 +2609,19 @@ class TestDefRef(unittest.TestCase):
         def_location: L.Location,
         ref_locations: list[L.Location],
     ):
-        doc = workspace.docs[def_location.uri]
+        def_doc = workspace.docs[def_location.uri]
 
         clue = Text("\n").join(
             [
                 Text("Checking symbol reference(s):"),
-                doc.highlight([def_location.range], "black on yellow"),
+                def_doc.highlight([def_location.range], "black on yellow"),
                 Text(""),
             ]
         )
 
         self.assertLocationsEqual(
-            doc,
-            workspace.workspace_index.references(
+            workspace.docs.values(),
+            workspace.index.references(
                 def_location.uri,
                 def_location.range.start,
             ),
@@ -2533,17 +2630,19 @@ class TestDefRef(unittest.TestCase):
         )
 
         for location in ref_locations:
+            ref_doc = workspace.docs[location.uri]
+
             clue = Text("\n").join(
                 [
                     Text("Checking symbol definition:"),
-                    doc.highlight([location.range], "black on yellow"),
+                    ref_doc.highlight([location.range], "black on yellow"),
                     Text(""),
                 ]
             )
 
             self.assertLocationsEqual(
-                doc,
-                workspace.workspace_index.definitions(
+                workspace.docs.values(),
+                workspace.index.definitions(
                     location.uri,
                     location.range.start,
                 ),
@@ -2638,6 +2737,35 @@ class TestDefRef(unittest.TestCase):
             TestWorkspace.single_doc(t),
             def_location=t.location_of("g", line=3),
             ref_locations=[t.location_of("g", line=4)],
+        )
+
+    def test_import(self):
+        t1 = TestDocument(
+            dedent(
+                """\
+                local x = { f: 1 };
+                local y = x.f;
+                x
+                """
+            ),
+            uri="file:///test/t1.jsonnet",
+        )
+
+        t2 = TestDocument(
+            "(import 't1.jsonnet').f",
+            uri="file:///test/t2.jsonnet",
+        )
+
+        self.checkDefRefs(
+            workspace=TestWorkspace(
+                root_uri="file:///test/",
+                docs=[t1, t2],
+            ),
+            def_location=t1.location_of("f"),
+            ref_locations=[
+                t1.location_of("f", line=2),
+                t2.location_of("f"),
+            ],
         )
 
 
