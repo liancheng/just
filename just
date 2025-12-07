@@ -55,13 +55,11 @@ def strip_comments(nodes: list[T.Node]) -> list[T.Node]:
 
 U = TypeVar("U")
 
+Maybe = tuple[U] | tuple[()]
 
-def maybe[U](v: U | None) -> tuple[U] | tuple[()]:
-    match v:
-        case None:
-            return ()
-        case _ as u:
-            return (u,)
+
+def maybe[U](v: U | None) -> Maybe[U]:
+    return () if v is None else (v,)
 
 
 def head_or_none[U](i: Iterable[U]) -> U | None:
@@ -1283,11 +1281,17 @@ class HashableLocation:
             )
         )
 
+    def __lt__(self, other: "HashableLocation") -> bool:
+        return self.location.range.start < other.location.range.start or (
+            self.location.range.start == other.location.range.start
+            and self.location.range.end < other.location.range.end
+        )
+
 
 class DocumentIndex(Visitor):
-    def __init__(self, workspace_index: "WorkspaceIndex", tree: Expr) -> None:
+    def __init__(self, workspace_index: "WorkspaceIndex", tree: Document) -> None:
         self.workspace_index = workspace_index
-        self.tree = tree
+        self.tree: Document = tree
         self.inlay_hints: dict[HashablePosition, L.InlayHint] = {}
         self.current_scope: Scope = Scope()
         self.current_self: Scope | None = None
@@ -1404,37 +1408,37 @@ class DocumentIndex(Visitor):
         finally:
             self.current_self = prev
 
-    def find_scope(self, e: Expr, scope: Scope) -> Scope | None:
-        log.info("find_scope:\n%s\n%s", e.pretty_tree, scope.pretty_tree)
-
+    def find_object(self, e: Expr, scope: Scope) -> Scope | None:
         match e:
             case Object() as obj if obj.self_scope is not None:
                 return obj.self_scope
+            case Document():
+                return self.find_object(e.body, Scope())
             case Id() as id:
                 return head_or_none(
                     found
                     for binding in maybe(scope.get(id))
                     for value in maybe(binding.value)
-                    for found in maybe(self.find_scope(value, binding.scope))
+                    for found in maybe(self.find_object(value, binding.scope))
                 )
             case FieldAccess() as f:
                 return head_or_none(
                     found
-                    for parent_scope in maybe(self.find_scope(f.obj, scope))
+                    for parent_scope in maybe(self.find_object(f.obj, scope))
                     for binding in maybe(parent_scope.get(f.field))
                     for value in maybe(binding.value)
-                    for found in maybe(self.find_scope(value, binding.scope))
+                    for found in maybe(self.find_object(value, binding.scope))
                 )
             case Binary(_, _, _, rhs):
-                return self.find_scope(rhs, self.current_scope)
+                return self.find_object(rhs, self.current_scope)
             case Import(_, "import", path):
                 return head_or_none(
                     found
                     for index in maybe(self.importee_index(path.raw))
-                    for found in maybe(self.find_scope(index.tree, index.current_scope))
+                    for found in maybe(
+                        self.find_object(index.tree, index.current_scope)
+                    )
                 )
-            case Local(_, _, body):
-                return self.find_scope(body, scope)
             case _:
                 return None
 
@@ -1543,19 +1547,18 @@ class DocumentIndex(Visitor):
                 )
             )
 
-    def resolve_importee_path(self, raw_path: str) -> Path | None:
+    def resolve_importee_path(self, raw_path: str) -> Path:
         root = Path.from_uri(self.workspace_index.root_uri)
-        path = root.joinpath(raw_path).absolute()
-        return path if path.exists() and path.is_file() else None
+        return root.joinpath(raw_path).absolute()
 
     def importee_index(self, raw_path: str) -> "DocumentIndex | None":
-        for path in maybe(self.resolve_importee_path(raw_path)):
-            return self.workspace_index.get_or_sync(
-                uri=path.as_uri(),
-                source=path.read_text(encoding="utf-8"),
-            )
+        path = self.resolve_importee_path(raw_path)
+        index = self.workspace_index.docs.get(path.as_uri())
 
-        return None
+        return index or self.workspace_index.get_or_sync(
+            uri=path.as_uri(),
+            source=path.read_text(encoding="utf-8"),
+        )
 
     def visit_import(self, e: Import):
         self.add_symbol(
@@ -1565,20 +1568,15 @@ class DocumentIndex(Visitor):
             selection_range=e.location.range,
         )
 
-        for importee_path in maybe(self.resolve_importee_path(e.path.raw)):
-            index = self.workspace_index.get_or_sync(
-                uri=importee_path.as_uri(),
-                source=importee_path.read_text(encoding="utf-8"),
+        self.add_hint(
+            L.InlayHint(
+                position=e.path.location.range.end,
+                label="",
+                kind=L.InlayHintKind.Parameter,
             )
+        )
 
-            self.add_hint(
-                L.InlayHint(
-                    position=e.path.location.range.end,
-                    label="",
-                    kind=L.InlayHintKind.Parameter,
-                )
-            )
-
+        for index in maybe(self.importee_index(e.path.raw)):
             self.workspace_index.add_reference(e.path.location, index.tree.location)
 
     def visit_object(self, e: Object):
@@ -1589,14 +1587,14 @@ class DocumentIndex(Visitor):
     def visit_field_access(self, e: FieldAccess):
         self.visit(e.obj)
 
-        for scope in maybe(self.find_scope(e.obj, self.current_scope)):
+        for scope in maybe(self.find_object(e.obj, self.current_scope)):
             for binding in maybe(scope.get(e.field)):
                 self.add_id_reference(e.field, binding)
 
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
 
-        lhs_scope = self.find_scope(e.lhs, self.current_scope)
+        lhs_scope = self.find_object(e.lhs, self.current_scope)
         with self.super_scope(lhs_scope):
             self.visit(e.rhs)
 
@@ -1620,14 +1618,14 @@ class WorkspaceIndex:
         self.ref_to_defs: LocationMap = defaultdict(list[L.Location])
         self.def_to_refs: LocationMap = defaultdict(list[L.Location])
 
-    def find_related_locations(
+    def find_linked_locations(
         self, uri: str, pos: L.Position, map: LocationMap
     ) -> list[L.Location]:
         # TODO: More efficient position-to-location search.
         return next(
-            iter(
+            (
                 locations
-                for key, locations in map.items()
+                for key, locations in sorted(map.items(), key=lambda pair: pair[0])
                 if uri == key.location.uri
                 and key.location.range.start <= pos <= key.location.range.end
             ),
@@ -1646,12 +1644,18 @@ class WorkspaceIndex:
         return defs, refs
 
     def definitions(self, uri: str, position: L.Position) -> list[L.Location]:
-        return self.find_related_locations(uri, position, self.ref_to_defs)
+        return self.find_linked_locations(uri, position, self.ref_to_defs)
 
     def references(self, uri: str, position: L.Position) -> list[L.Location]:
-        return self.find_related_locations(uri, position, self.def_to_refs)
+        return self.find_linked_locations(uri, position, self.def_to_refs)
 
-    def sync(self, uri: str, source: str, strict_on_error: bool = False):
+    def sync(
+        self,
+        uri: str,
+        source: str,
+        strict_on_error: bool = False,
+        invalidate_existing: bool = True,
+    ):
         # When a document is being edited, parsing likely would fail. `strict_on_error`
         # determines the behavior on parsing errors:
         #
@@ -1664,7 +1668,7 @@ class WorkspaceIndex:
         #
         # The latter is desired when used in editors to avoid glitches.
 
-        if strict_on_error:
+        if uri in self.docs and strict_on_error and invalidate_existing:
             self.invalidate_doc(uri)
 
         try:
@@ -1676,12 +1680,12 @@ class WorkspaceIndex:
             else:
                 return
 
-        if not strict_on_error:
+        if uri in self.docs and not strict_on_error and invalidate_existing:
             self.invalidate_doc(uri)
 
-        self.docs[uri] = DocumentIndex(self, tree)
+        self.docs[uri] = DocumentIndex(self, tree.to(Document))
 
-    def cleanup_location_map(self, uri: str, map: LocationMap) -> LocationMap:
+    def invalidate_location_map(self, uri: str, map: LocationMap) -> LocationMap:
         map = defaultdict(
             list[L.Location],
             {
@@ -1697,8 +1701,8 @@ class WorkspaceIndex:
         return map
 
     def invalidate_doc(self, uri: str):
-        self.ref_to_defs = self.cleanup_location_map(uri, self.ref_to_defs)
-        self.def_to_refs = self.cleanup_location_map(uri, self.def_to_refs)
+        self.ref_to_defs = self.invalidate_location_map(uri, self.ref_to_defs)
+        self.def_to_refs = self.invalidate_location_map(uri, self.def_to_refs)
 
         if uri in self.workspace_symbols:
             del self.workspace_symbols[uri]
@@ -1846,9 +1850,12 @@ def tree(
     Console(markup=False).print(tree)
 
 
-@app.command()
-def test():
-    unittest.main(argv=["--locals"], verbosity=1)
+@app.command(context_settings=dict(allow_extra_args=True))
+def test(context: typer.Context):
+    # `unittest` requires the first argument to be the program name, while Typer strips
+    # the program (`just`) and command (`test`) names.
+    argv = ["test"] + context.args
+    unittest.main(argv=argv)
 
 
 class TestDocument:
@@ -1950,17 +1957,26 @@ class TestDocument:
         height = len(raw_lines)
         gutter_width = len(str(height))
 
+        # Renders a horizontal ruler like the following:
+        #
+        #     0    5   10   15      <-- header line
+        #     |''''|''''|''''|''''  <-- guide line
+        #   1 |local x = { f: 1 };
+        #   2 |local y = x.f;
+        #   3 |x
         def render_ruler(width: int, left_padding: int) -> list[Text]:
+            # To build the header line, builds right-aligned 5-character wide column
+            # segments first, joins them together, then chops off the first 4 spaces.
+            # The final left-padding is for the line number gutter.
             every_5_chars = range(0, width // 5 * 5 + 1, 5)
-            segments = [f"{i:>5}" for i in every_5_chars]
+            header_segs = [f"{i:>5}" for i in every_5_chars]
+            header_line = styled("".join(header_segs)[4:], "grey50")
+            header_line.pad_left(left_padding)
 
-            line1 = styled("".join(segments)[4:], "grey50")
-            line2 = styled(("|''''" * (width // 5 + 1))[: width + 1], "grey50")
+            guide_line = styled(("|''''" * (width // 5 + 1))[: width + 1], "grey50")
+            guide_line.pad_left(left_padding)
 
-            line1.pad_left(left_padding)
-            line2.pad_left(left_padding)
-
-            return [line1, line2]
+            return [header_line, guide_line]
 
         # Renders a top horizontal ruler.
         ruler_lines = render_ruler(width, gutter_width + 1)
@@ -2538,9 +2554,15 @@ class TestWorkspace:
     def __init__(self, root_uri: str, docs: list[TestDocument]) -> None:
         self.docs = {doc.uri: doc for doc in docs}
         self.index = WorkspaceIndex(root_uri)
+
         for doc in docs:
             assert doc.uri not in self.index.docs
-            self.index.sync(doc.uri, doc.source, strict_on_error=True)
+            self.index.sync(
+                doc.uri,
+                doc.source,
+                strict_on_error=True,
+                invalidate_existing=False,
+            )
 
     @staticmethod
     def single_doc(doc: TestDocument) -> "TestWorkspace":
@@ -2548,7 +2570,13 @@ class TestWorkspace:
         return TestWorkspace(root_uri, [doc])
 
 
-def side_by_side(lhs: Text, rhs: Text) -> Text:
+def side_by_side(lhs: Text | str, rhs: Text | str) -> Text:
+    if isinstance(lhs, str):
+        lhs = Text(lhs)
+
+    if isinstance(rhs, str):
+        rhs = Text(rhs)
+
     lhs_lines = lhs.split()
     rhs_lines = rhs.split()
 
@@ -2756,9 +2784,7 @@ class TestDefRef(unittest.TestCase):
         t1 = TestDocument(
             dedent(
                 """\
-                local x = { f: 1 };
-                local y = x.f;
-                x
+                { f: 1 }
                 """
             ),
             uri="file:///test/t1.jsonnet",
@@ -2775,10 +2801,7 @@ class TestDefRef(unittest.TestCase):
                 docs=[t1, t2],
             ),
             def_location=t1.location_of("f"),
-            ref_locations=[
-                t1.location_of("f", line=2),
-                t2.location_of("f"),
-            ],
+            ref_locations=[t2.location_of("f")],
         )
 
 
