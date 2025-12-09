@@ -17,7 +17,7 @@ import unittest
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import StrEnum
-from itertools import groupby
+from itertools import accumulate, chain, groupby
 from pathlib import Path
 from textwrap import dedent
 from typing import Annotated, Any, Iterable, Type, TypeVar, cast
@@ -476,7 +476,7 @@ class Bind(AST):
         assert node.type == "bind"
 
         children = strip_comments(node.named_children)
-        assert 2 <= len(children) <= 3
+        assert len(children) >= 2
 
         if len(node.children_by_field_name("function")) == 0:
             id, value, *_ = children
@@ -523,16 +523,23 @@ class Local(Expr):
     binds: list[Bind]
     body: Expr
 
+    def __post_init__(self):
+        self.scope: Scope | None = None
+
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "Local":
         assert node.type == "local_bind"
 
-        _, *binds, expr = strip_comments(node.named_children)
+        binds, body = [], []
+
+        # Drops the first node, which is the "local" keyword.
+        for child in strip_comments(node.named_children)[1:]:
+            (binds if child.type == "bind" else body).append(child)
 
         return Local(
             location=location_of(uri, node),
             binds=[Bind.from_doc(uri, bind) for bind in binds],
-            body=Expr.from_doc(uri, expr),
+            body=Expr.from_doc(uri, body[0]),
         )
 
 
@@ -564,19 +571,21 @@ class Fn(Expr):
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "Fn":
         assert node.type == "anonymous_function"
+        first, *rest = strip_comments(node.named_children)
 
-        children = strip_comments(node.named_children)
-        assert 1 <= len(children) <= 2
+        match first, rest:
+            case _, (body, *_) if first.type == "params":
+                params = [
+                    Param.from_doc(uri, param)
+                    for param in strip_comments(first.named_children)
+                ]
+            case body, *_:
+                params = []
 
-        *maybe_params, body_node = children
         return Fn(
             location=location_of(uri, node),
-            params=[
-                Param.from_doc(uri, param)
-                for params in maybe_params
-                for param in strip_comments(params.named_children)
-            ],
-            body=Expr.from_doc(uri, body_node),
+            params=params,
+            body=Expr.from_doc(uri, body),
         )
 
 
@@ -739,40 +748,43 @@ class AssertExpr(Expr):
         # should map to a single tree-sitter node containing an assertion followed by an
         # expression. E.g., the given the following expression:
         #
-        #   assert true: "never"; x
+        #   assert true: "never"; /* ! */ x
         #
         # it should be parsed into a single `<assert_expr>` node:
         #
-        #   <assert_expr>     | assert true: "never"; x
+        #   <assert_expr>     | assert true: "never"; /* ! */ x
         #       <assert>      | assert true: "never"
         #           <_expr>   |        true
         #           <string>  |              "never"
-        #       <id>          |                       x
+        #       <comment>     |                       /* ! */
+        #       <id>          |                               x
         #
         # However, `tree-sitter-jsonnet` explicitly hides the top node by prefixing the
-        # rule with an underscore (`_assert_expr`), and therefore the parser only
-        # returns the two child nodes:
+        # rule with an underscore (`_assert_expr` instead of `assert_expr`), and the
+        # parser only returns the child nodes:
         #
         #   <assert>          | assert true: "never"
         #       <_expr>       |        true
         #       <string>      |              "never"
-        #   <id>              |                       x
+        #   <comment>         |                       /* ! */
+        #   <id>              |                               x
         #
-        # This complicates parsing values in local bindings and function bodies, because
-        # a bound value and a function body can be either one node for a regular
-        # expression or two nodes for an assertion expression.
+        # This unnecessarily complicates parsing values in local bindings and function
+        # bodies, because a bound value and a function body can be either one node for a
+        # regular expression or two nodes for an assertion expression.
 
-        # Finds the first non-comment sibling node, which holds the body expression.
-        body = node.next_named_sibling
-        while body is not None and body.is_extra:
-            body = body.next_named_sibling
+        assertion = Assert.from_doc(uri, node)
 
-        assert body is not None
-        return AssertExpr(
-            L.Location(uri, merge_ranges(node, body)),
-            Assert.from_doc(uri, node),
-            Expr.from_doc(uri, body),
-        )
+        # Finds the first non-comment sibling named node. This is the first node of the
+        # body expression.
+        not_comment = node.next_named_sibling
+        while not_comment is not None and not_comment.is_extra:
+            not_comment = not_comment.next_named_sibling
+
+        assert not_comment is not None
+        body = Expr.from_doc(uri, not_comment)
+
+        return AssertExpr(merge_locations(assertion, body), assertion, body)
 
 
 @D.dataclass
@@ -816,6 +828,9 @@ class Field(AST):
     value: Expr
     visibility: Visibility = Visibility.Default
     inherited: bool = False
+
+    def __post_init__(self):
+        self.enclosing_self_scope: Scope | None = None
 
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "Field":
@@ -975,17 +990,19 @@ class Slice(Expr):
 class If(Expr):
     condition: Expr
     consequence: Expr
-    alternative: Expr
+    alternative: Expr | None
 
     @staticmethod
     def from_doc(uri: str, node: T.Node) -> "If":
         assert node.type == "conditional"
-        condition, consequence, alternative = strip_comments(node.named_children)
+        condition, consequence, *maybe_alternative = strip_comments(node.named_children)
         return If(
             location=location_of(uri, node),
             condition=Expr.from_doc(uri, condition),
             consequence=Expr.from_doc(uri, consequence),
-            alternative=Expr.from_doc(uri, alternative),
+            alternative=head_or_none(
+                Expr.from_doc(uri, alternative) for alternative in maybe_alternative
+            ),
         )
 
 
@@ -1118,7 +1135,8 @@ class Visitor:
     def visit_if(self, e: If):
         self.visit(e.condition)
         self.visit(e.consequence)
-        self.visit(e.alternative)
+        if e.alternative is not None:
+            self.visit(e.alternative)
 
     def visit_object(self, e: Object):
         for f in e.fields:
@@ -1231,7 +1249,7 @@ class Binding:
     scope: "Scope"
     name: str
     location: L.Location
-    value: Expr | None = None
+    value: AST | None = None
 
 
 @D.dataclass
@@ -1240,7 +1258,7 @@ class Scope:
     parent: "Scope | None" = None
     children: list["Scope"] = D.field(default_factory=list)
 
-    def bind(self, name: str, location: L.Location, value: Expr | None = None):
+    def bind(self, name: str, location: L.Location, value: AST | None = None):
         self.bindings.insert(0, Binding(self, name, location, value))
 
     def get(self, id: Id) -> Binding | None:
@@ -1283,9 +1301,20 @@ class HashableLocation:
         )
 
     def __lt__(self, other: "HashableLocation") -> bool:
-        return self.location.range.start < other.location.range.start or (
-            self.location.range.start == other.location.range.start
-            and self.location.range.end < other.location.range.end
+        self_in_other = (
+            other.location.range.start <= self.location.range.start
+            and self.location.range.end <= other.location.range.end
+        )
+
+        return (
+            self.location.uri < other.location.uri
+            or self.location.uri == other.location.uri
+            and self.location.range != other.location.range
+            and (
+                self_in_other
+                or self.location.range.start <= other.location.range.start
+                and self.location.range.end <= other.location.range.end
+            )
         )
 
 
@@ -1409,45 +1438,54 @@ class DocumentIndex(Visitor):
         finally:
             self.current_self = prev
 
-    def find_object(self, e: Expr, scope: Scope) -> Scope | None:
-        match e:
+    def find_object_scope(
+        self,
+        t: AST,
+        scope: Scope,
+        self_scope: Scope | None = None,
+        super_scope: Scope | None = None,
+    ) -> Scope | None:
+        # Not used yet
+        del super_scope
+
+        match t:
             case Object() as obj if obj.self_scope is not None:
                 return obj.self_scope
             case Document():
-                return self.find_object(e.body, Scope())
+                return self.find_object_scope(t.body, Scope())
             case Id() as id:
-                return head_or_none(
-                    found
-                    for binding in maybe(scope.get(id))
-                    for value in maybe(binding.value)
-                    for found in maybe(self.find_object(value, binding.scope))
-                )
+                for binding in maybe(scope.get(id)):
+                    for value in maybe(binding.value):
+                        return self.find_object_scope(value, binding.scope)
+            case Field() as f:
+                for self_scope in maybe(f.enclosing_self_scope):
+                    return self.find_object_scope(f.value, scope, self_scope)
             case FieldAccess() as f:
-                return head_or_none(
-                    found
-                    for parent_scope in maybe(self.find_object(f.obj, scope))
-                    for binding in maybe(parent_scope.get(f.field))
-                    for value in maybe(binding.value)
-                    for found in maybe(self.find_object(value, binding.scope))
-                )
+                for parent_scope in maybe(self.find_object_scope(f.obj, scope)):
+                    for binding in maybe(parent_scope.get(f.field)):
+                        for value in maybe(binding.value):
+                            return self.find_object_scope(value, binding.scope)
             case Binary(_, _, _, rhs):
-                return self.find_object(rhs, self.current_scope)
+                return self.find_object_scope(rhs, self.current_scope)
             case Import(_, "import", path):
-                return head_or_none(
-                    found
-                    for index in maybe(self.importee_index(path.raw))
-                    for found in maybe(
-                        self.find_object(index.tree, index.current_scope)
-                    )
-                )
+                for index in maybe(self.importee_index(path.raw)):
+                    return self.find_object_scope(index.tree, index.current_scope)
+            case Local() as l:
+                for local_scope in maybe(l.scope):
+                    return self.find_object_scope(l.body, local_scope)
+            case Binary(_, Operator.Plus, _, rhs):
+                return self.find_object_scope(rhs, scope)
             case _:
                 return None
+
+        return None
 
     def visit_local(self, e: Local):
         for b in e.binds:
             self.visit_bind(b)
 
-        with self.nested_scope():
+        with self.nested_scope() as nested:
+            e.scope = nested
             self.visit(e.body)
 
     def visit_bind(self, b: Bind):
@@ -1519,11 +1557,13 @@ class DocumentIndex(Visitor):
     def visit_field(self, e: Object, f: Field):
         assert e.self_scope is not None
 
+        f.enclosing_self_scope = e.self_scope
+
         match f.key:
-            case FixedKey(_, Id(location, name)):
-                e.self_scope.bind(name, location, f.value)
-            case FixedKey(_, Str(location, raw)):
-                e.self_scope.bind(raw, location, f.value)
+            case FixedKey(_, Id(_, name)):
+                e.self_scope.bind(name, f.location, f)
+            case FixedKey(_, Str(_, raw)):
+                e.self_scope.bind(raw, f.location, f)
 
         # Adds an optional inlay hint for visibility and inheritance.
         label_parts = []
@@ -1556,9 +1596,13 @@ class DocumentIndex(Visitor):
         path = self.resolve_importee_path(raw_path)
         index = self.workspace_index.docs.get(path.as_uri())
 
-        return index or self.workspace_index.get_or_sync(
-            uri=path.as_uri(),
-            source=path.read_text(encoding="utf-8"),
+        return index or (
+            self.workspace_index.get_or_sync(
+                uri=path.as_uri(),
+                source=path.read_text(encoding="utf-8"),
+            )
+            if path.exists()
+            else None
         )
 
     def visit_import(self, e: Import):
@@ -1588,14 +1632,14 @@ class DocumentIndex(Visitor):
     def visit_field_access(self, e: FieldAccess):
         self.visit(e.obj)
 
-        for scope in maybe(self.find_object(e.obj, self.current_scope)):
+        for scope in maybe(self.find_object_scope(e.obj, self.current_scope)):
             for binding in maybe(scope.get(e.field)):
                 self.add_id_reference(e.field, binding)
 
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
 
-        lhs_scope = self.find_object(e.lhs, self.current_scope)
+        lhs_scope = self.find_object_scope(e.lhs, self.current_scope)
         with self.super_scope(lhs_scope):
             self.visit(e.rhs)
 
@@ -1623,15 +1667,13 @@ class WorkspaceIndex:
         self, uri: str, pos: L.Position, map: LocationMap
     ) -> list[L.Location]:
         # TODO: More efficient position-to-location search.
-        return next(
-            (
-                locations
-                for key, locations in sorted(map.items(), key=lambda pair: pair[0])
-                if uri == key.location.uri
-                and key.location.range.start <= pos <= key.location.range.end
-            ),
-            [],
-        )
+
+        for key, locations in sorted(map.items(), key=lambda pair: pair[0]):
+            r = key.location.range
+            if uri == key.location.uri and r.start <= pos <= r.end:
+                return locations
+
+        return []
 
     def add_reference(
         self, ref_location: L.Location, def_location: L.Location
@@ -1650,40 +1692,9 @@ class WorkspaceIndex:
     def references(self, uri: str, position: L.Position) -> list[L.Location]:
         return self.find_linked_locations(uri, position, self.def_to_refs)
 
-    def sync(
-        self,
-        uri: str,
-        source: str,
-        strict_on_error: bool = False,
-        invalidate_existing: bool = True,
-    ):
-        # When a document is being edited, parsing likely would fail. `strict_on_error`
-        # determines the behavior on parsing errors:
-        #
-        #   * When `True` (used in tests):
-        #       * Always cleans up the old doc ahead of time.
-        #       * Re-raises parsing errors, if any.
-        #   * When `False`:
-        #       * Ignores parsing errors
-        #       * Does NOT cleanup the old doc on parsing errors.
-        #
-        # The latter is desired when used in editors to avoid glitches.
-
-        if uri in self.docs and strict_on_error and invalidate_existing:
-            self.invalidate_doc(uri)
-
-        try:
-            cst = parse_jsonnet(source)
-            tree = Expr.from_doc(uri, cst)
-        except Exception:
-            if strict_on_error:
-                raise
-            else:
-                return
-
-        if uri in self.docs and not strict_on_error and invalidate_existing:
-            self.invalidate_doc(uri)
-
+    def sync(self, uri: str, source: str):
+        cst = parse_jsonnet(source)
+        tree = Expr.from_doc(uri, cst)
         self.docs[uri] = DocumentIndex(self, tree.to(Document))
 
     def invalidate_location_map(self, uri: str, map: LocationMap) -> LocationMap:
@@ -1851,6 +1862,34 @@ def tree(
     Console(markup=False).print(tree)
 
 
+@app.command()
+def index(
+    workspace_root: Annotated[
+        Path,
+        typer.Argument(
+            help="The workspace root directory.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            allow_dash=False,
+        ),
+    ],
+    path: Annotated[
+        Path,
+        typer.Argument(
+            help="The Jsonnet file to index",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            allow_dash=False,
+        ),
+    ],
+):
+    WorkspaceIndex(workspace_root.as_uri()).sync(path.as_uri(), path.read_text())
+
+
 @app.command(context_settings=dict(allow_extra_args=True))
 def test(context: typer.Context):
     # `unittest` requires the first argument to be the program name, while Typer strips
@@ -1867,14 +1906,14 @@ class TestDocument:
         self.body = Document.from_doc(self.uri, self.root).body
 
         self.lines = source.splitlines(keepends=True)
-        if self.lines[-1].endswith("\n"):
+
+        # Appends the last empty line if needed.
+        if source.endswith("\n"):
             self.lines.append("")
 
         # Computes the character offset of the first character in each line, used for
         # converting line-character positions to offsets.
-        self.line_offsets = [0]
-        for line in self.lines[:-1]:
-            self.line_offsets.append(len(line) + self.line_offsets[-1])
+        self.line_offsets = list(accumulate(chain([0], map(len, self.lines))))
 
     def query_one(self, query: T.Query, capture: str) -> AST:
         [node] = T.QueryCursor(query).captures(self.root).get(capture, [])
@@ -2126,6 +2165,53 @@ class TestAST(unittest.TestCase):
                 location=t.body.location,
                 binds=[t.id("x").bind(t.num(1))],
                 body=t.id("x", nth=2),
+            ),
+        )
+
+    def test_local_with_asserts(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local v1 = 0;
+                assert true;
+                assert true;
+                v1 + 2
+                """
+            )
+        )
+
+        inner_assert_expr = AssertExpr(
+            location=merge_locations(
+                t.location_of("assert", line=3),
+                t.location_of("v1 + 2", line=4),
+            ),
+            assertion=Assert(
+                location=t.location_of("assert true", line=3),
+                condition=t.boolean(True, line=3),
+            ),
+            body=t.id("v1", line=4) + t.num(2, line=4),
+        )
+
+        outer_assert_expr = AssertExpr(
+            location=merge_locations(
+                t.location_of("assert", line=2),
+                t.location_of("v1 + 2", line=4),
+            ),
+            assertion=Assert(
+                location=t.location_of("assert true", line=2),
+                condition=t.boolean(True, line=2),
+            ),
+            body=inner_assert_expr,
+        )
+
+        self.assertAstEqual(
+            t.body,
+            Local(
+                location=t.body.location,
+                binds=[
+                    t.id("v1").bind(t.num(0)),
+                ],
+                body=outer_assert_expr,
             ),
         )
 
@@ -2561,12 +2647,7 @@ class TestWorkspace:
 
         for doc in docs:
             assert doc.uri not in self.index.docs
-            self.index.sync(
-                doc.uri,
-                doc.source,
-                strict_on_error=True,
-                invalidate_existing=False,
-            )
+            self.index.sync(doc.uri, doc.source)
 
     @staticmethod
     def single_doc(doc: TestDocument) -> "TestWorkspace":
@@ -2696,11 +2777,13 @@ class TestDefRef(unittest.TestCase):
 
         clue = Text("\n").join(
             [
+                Text("Indexed definition(s) and reference(s):", style="default"),
+                workspace.dump_references(),
+                Text(""),
+                workspace.dump_definitions(),
+                Text(""),
                 Text("Checking symbol reference(s):"),
                 def_doc.highlight([def_location.range], "black on yellow"),
-                Text(""),
-                Text("Definitions and references:"),
-                workspace.dump_references(),
                 Text(""),
             ]
         )
@@ -2754,7 +2837,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("f"),
+            def_location=t.location_of("f: 1"),
             ref_locations=[t.location_of("f", nth=2)],
         )
 
@@ -2763,17 +2846,26 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("g"),
+            def_location=t.location_of("g: 1"),
             ref_locations=[t.location_of("g", nth=2)],
         )
 
     def test_obj_obj_composition(self):
-        t = TestDocument("({ f: 1 } { f: 2 }).f")
+        t = TestDocument(
+            dedent(
+                """\
+                (
+                    { f: 1 }
+                    { f: 2 }
+                ).f
+                """
+            )
+        )
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("f", nth=2),
-            ref_locations=[t.location_of("f", nth=3)],
+            def_location=t.location_of("f: 2", line=3),
+            ref_locations=[t.location_of("f", line=4)],
         )
 
     def test_var_obj_composition(self):
@@ -2788,7 +2880,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("f", line=2),
+            def_location=t.location_of("f: 2", line=2),
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
@@ -2804,7 +2896,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("f"),
+            def_location=t.location_of("f: 1"),
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
@@ -2822,7 +2914,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             TestWorkspace.single_doc(t),
-            def_location=t.location_of("g", line=3),
+            def_location=t.location_of("g: 3", line=3),
             ref_locations=[t.location_of("g", line=4)],
         )
 
@@ -2842,7 +2934,27 @@ class TestDefRef(unittest.TestCase):
                 root_uri="file:///test/",
                 docs=[t1, t2],
             ),
-            def_location=t1.location_of("f"),
+            def_location=t1.location_of("f: 1"),
+            ref_locations=[t2.location_of("f")],
+        )
+
+    def test_import_with_local(self):
+        t1 = TestDocument(
+            "local o1 = { f: 0 }; o1",
+            uri="file:///test/t1.jsonnet",
+        )
+
+        t2 = TestDocument(
+            "local o2 = import 't1.jsonnet'; o2.f",
+            uri="file:///test/t2.jsonnet",
+        )
+
+        self.checkDefRefs(
+            workspace=TestWorkspace(
+                root_uri="file:///test/",
+                docs=[t1, t2],
+            ),
+            def_location=t1.location_of("f: 0"),
             ref_locations=[t2.location_of("f")],
         )
 
