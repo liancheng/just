@@ -1638,7 +1638,11 @@ class DocumentIndex(Visitor):
 
     def resolve_importee_path(self, raw_path: str) -> Path:
         root = Path.from_uri(self.workspace_index.root_uri)
-        return root.joinpath(raw_path).absolute()
+
+        if raw_path.startswith("../") or raw_path.startswith("./"):
+            return Path.from_uri(self.uri).parent.joinpath(raw_path).absolute()
+        else:
+            return root.joinpath(raw_path).absolute()
 
     def importee_index(self, raw_path: str) -> "DocumentIndex | None":
         path = self.resolve_importee_path(raw_path)
