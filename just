@@ -2673,7 +2673,17 @@ class TestAST(unittest.TestCase):
         )
 
     def test_obj_comp(self):
-        t = TestDocument("{ ['f' + x]: 0 for x in [1, 2] if x > 1 }")
+        t = TestDocument(
+            dedent(
+                """\
+                {
+                    ['f' + x]: 0
+                    for x in [1, 2]
+                    if x > 1
+                }
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "object"),
@@ -2681,28 +2691,44 @@ class TestAST(unittest.TestCase):
                 location=t.body.location,
                 binds=[],
                 field=Field(
-                    location=t.location_of("['f' + x]: 0"),
+                    location=t.location_of("['f' + x]: 0", line=2),
                     key=DynamicKey(
-                        t.location_of("['f' + x]"),
-                        t.str("f", literal="'f'") + t.id("x"),
+                        t.location_of("['f' + x]", line=2),
+                        t.str("f", literal="'f'", line=2) + t.id("x", line=2),
                     ),
-                    value=t.num(0),
+                    value=t.num(0, line=2),
                 ),
                 for_spec=ForSpec(
-                    location=t.location_of("for x in [1, 2]"),
-                    id=t.id("x", nth=2),
+                    location=t.location_of("for x in [1, 2]", line=3),
+                    id=t.id("x", line=3),
                     expr=Array(
-                        location=t.location_of("[1, 2]"),
-                        values=[t.num(1), t.num(2)],
+                        location=t.location_of("[1, 2]", line=3),
+                        values=[t.num(1, line=3), t.num(2, line=3)],
                     ),
                 ),
                 comp_spec=[
                     IfSpec(
-                        location=t.location_of("if x > 1"),
-                        condition=t.id("x", nth=3) > t.num(1, nth=2),
+                        location=t.location_of("if x > 1", line=4),
+                        condition=t.id("x", line=4) > t.num(1, line=4),
                     )
                 ],
             ),
+        )
+
+    @unittest.skip("tree-sitter-jsonnet does not handle `objforloop` with local.")
+    def test_obj_comp_with_local(self):
+        TestDocument(
+            dedent(
+                """\
+                {
+                    local y = 3,
+                    ['f' + x]: x,
+                    local z = 4,
+                    for x in [1, 2]
+                    if x > 1
+                }
+                """
+            )
         )
 
 
@@ -3102,13 +3128,13 @@ class TestDefRef(unittest.TestCase):
         )
 
         self.checkDefRefs(
-            workspace=TestWorkspace.single_doc(t),
+            TestWorkspace.single_doc(t),
             def_location=t.location_of("f1: 1", line=2),
             ref_locations=[t.location_of("f1", line=6)],
         )
 
         self.checkDefRefs(
-            workspace=TestWorkspace.single_doc(t),
+            TestWorkspace.single_doc(t),
             def_location=t.location_of("o1"),
             ref_locations=[t.location_of("o1", line=4)],
         )
@@ -3135,15 +3161,38 @@ class TestDefRef(unittest.TestCase):
         # won't be set up until we index `o1 + o2`.
 
         self.checkDefRefs(
-            workspace=TestWorkspace.single_doc(t),
+            TestWorkspace.single_doc(t),
             def_location=t.location_of("o1"),
             ref_locations=[t.location_of("o1", line=8)],
         )
 
         self.checkDefRefs(
-            workspace=TestWorkspace.single_doc(t),
+            TestWorkspace.single_doc(t),
             def_location=t.location_of("o2", line=4),
             ref_locations=[t.location_of("o2", line=8)],
+        )
+
+    def test_fn_params(self):
+        t = TestDocument(
+            dedent(
+                """\
+                local f(p) =
+                    p + 1;
+                f(1)
+                """
+            )
+        )
+
+        self.checkDefRefs(
+            TestWorkspace.single_doc(t),
+            def_location=t.location_of("p"),
+            ref_locations=[t.location_of("p", line=2)],
+        )
+
+        self.checkDefRefs(
+            TestWorkspace.single_doc(t),
+            def_location=t.location_of("f"),
+            ref_locations=[t.location_of("f", line=3)],
         )
 
 
