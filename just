@@ -857,7 +857,7 @@ class Field(AST):
     inherited: bool = False
 
     def __post_init__(self):
-        self.enclosing_self_scope: Scope | None = None
+        self.enclosing_obj: Object | None = None
 
     @staticmethod
     def from_cst(uri: str, node: T.Node) -> "Field":
@@ -913,8 +913,9 @@ class Object(Expr):
     fields: list[Field] = D.field(default_factory=list)
 
     def __post_init__(self):
-        self.self_scope: Scope | None = None
+        self.var_scope: Scope | None = None
         self.super_scope: Scope | None = None
+        self.self_scope: Scope | None = None
 
     @staticmethod
     def from_cst(uri: str, node: T.Node) -> "Object":
@@ -1316,6 +1317,10 @@ class Scope:
     def pretty_tree(self) -> str:
         return str(PrettyScope(self))
 
+    @staticmethod
+    def empty() -> "Scope":
+        return Scope()
+
 
 @D.dataclass(frozen=True)
 class HashablePosition:
@@ -1478,43 +1483,35 @@ class DocumentIndex(Visitor):
         finally:
             self.current_self_scope = prev
 
-    def find_object_scope(
-        self,
-        t: AST,
-        scope: Scope,
-        self_scope: Scope | None = None,
-        super_scope: Scope | None = None,
-    ) -> Scope | None:
-        # Not used yet
-        del super_scope
-
+    def find_self_scope(self, t: AST, scope: Scope) -> Scope | None:
         match t:
             case Object() as obj if obj.self_scope is not None:
                 return obj.self_scope
             case Document():
-                return self.find_object_scope(t.body, Scope())
+                return self.find_self_scope(t.body, Scope())
             case Id() as id:
                 for binding in maybe(scope.get(id)):
                     for value in maybe(binding.value):
-                        return self.find_object_scope(value, binding.scope)
+                        return self.find_self_scope(value, binding.scope)
             case Field() as f:
-                for self_scope in maybe(f.enclosing_self_scope):
-                    return self.find_object_scope(f.value, scope, self_scope)
+                for obj in maybe(f.enclosing_obj):
+                    for var_scope in maybe(obj.var_scope):
+                        return self.find_self_scope(f.value, var_scope)
             case FieldAccess() as f:
-                for parent_scope in maybe(self.find_object_scope(f.obj, scope)):
+                for parent_scope in maybe(self.find_self_scope(f.obj, scope)):
                     for binding in maybe(parent_scope.get(f.field)):
                         for value in maybe(binding.value):
-                            return self.find_object_scope(value, binding.scope)
+                            return self.find_self_scope(value, binding.scope)
             case Binary(_, _, _, rhs):
-                return self.find_object_scope(rhs, self.current_var_scope)
+                return self.find_self_scope(rhs, self.current_var_scope)
             case Import(_, "import", path):
                 for index in maybe(self.importee_index(path.raw)):
-                    return self.find_object_scope(index.tree, index.current_var_scope)
+                    return self.find_self_scope(index.tree, index.current_var_scope)
             case Local() as l:
                 for local_scope in maybe(l.scope):
-                    return self.find_object_scope(l.body, local_scope)
+                    return self.find_self_scope(l.body, local_scope)
             case Binary(_, Operator.Plus, _, rhs):
-                return self.find_object_scope(rhs, scope)
+                return self.find_self_scope(rhs, scope)
             case Self() as e:
                 return e.scope
             case Super() as e:
@@ -1601,7 +1598,7 @@ class DocumentIndex(Visitor):
     def visit_field_key(self, e: Object, f: Field):
         assert e.self_scope is not None
 
-        f.enclosing_self_scope = e.self_scope
+        f.enclosing_obj = e
 
         match f.key:
             case FixedKey(_, Id(_, name)):
@@ -1673,8 +1670,9 @@ class DocumentIndex(Visitor):
             self.workspace_index.add_reference(e.path.location, index.tree.location)
 
     def visit_object(self, e: Object):
-        e.self_scope = Scope()
+        e.var_scope = self.current_var_scope
         e.super_scope = self.current_super_scope
+        e.self_scope = Scope.empty() if e.super_scope is None else e.super_scope.nest()
 
         with self.self_scope(e.self_scope):
             super().visit_object(e)
@@ -1682,7 +1680,7 @@ class DocumentIndex(Visitor):
     def visit_field_access(self, e: FieldAccess):
         self.visit(e.obj)
 
-        for scope in maybe(self.find_object_scope(e.obj, self.current_var_scope)):
+        for scope in maybe(self.find_self_scope(e.obj, self.current_var_scope)):
             for binding in maybe(scope.get(e.field)):
                 self.add_id_reference(e.field, binding)
 
@@ -1694,9 +1692,8 @@ class DocumentIndex(Visitor):
 
     def visit_binary(self, e: Binary):
         self.visit(e.lhs)
-
-        lhs_scope = self.find_object_scope(e.lhs, self.current_var_scope)
-        with self.super_scope(lhs_scope):
+        base_self = self.find_self_scope(e.lhs, self.current_var_scope)
+        with self.super_scope(base_self):
             self.visit(e.rhs)
 
 
@@ -3007,7 +3004,6 @@ class TestDefRef(unittest.TestCase):
             ref_locations=[t2.location_of("f")],
         )
 
-    @unittest.skip("FIXME")
     def test_same_var_field_names(self):
         t1 = TestDocument(
             dedent(
