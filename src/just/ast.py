@@ -1,0 +1,1249 @@
+import dataclasses as D
+from enum import StrEnum
+from itertools import dropwhile
+from textwrap import dedent
+from typing import Any, Callable, ClassVar, Iterator, Type, TypeVar, cast
+
+import lsprotocol.types as L
+import tree_sitter as T
+
+from just.pretty import PrettyTree
+from just.util import head_or_none, maybe
+
+
+def strip_comments(nodes: list[T.Node]) -> list[T.Node]:
+    return [node for node in nodes if not node.type == "comment"]
+
+
+ASTType = TypeVar("ASTType")
+
+
+@D.dataclass
+class AST:
+    location: L.Location
+
+    d: ClassVar[dict[str, Callable[[str, T.Node], AST]]] = {}
+
+    @staticmethod
+    def register(node_name: str, fn: Callable[[str, T.Node], AST]):
+        AST.d[node_name] = fn
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "AST":
+        def skip_paren(uri: str, node: T.Node):
+            return AST.from_cst(uri, strip_comments(node.named_children)[0])
+
+        def dispatch_object(uri: str, node: T.Node):
+            match strip_comments(node.named_children):
+                case head, *_ if head.type == "objforloop":
+                    return ObjComp.from_cst(uri, head)
+                case _:
+                    return Object.from_cst(uri, node)
+
+        dispatch = {
+            "anonymous_function": Fn.from_cst,
+            "array": Array.from_cst,
+            "assert": AssertExpr.from_cst,
+            "binary": Binary.from_cst,
+            "bind": Bind.from_cst,
+            "conditional": If.from_cst,
+            "document": Document.from_cst,
+            "false": Bool.from_cst,
+            "field": Field.from_cst,
+            "fieldaccess_super": FieldAccess.from_cst,
+            "fieldaccess": FieldAccess.from_cst,
+            "fieldname": FieldKey.from_cst,
+            "forloop": ListComp.from_cst,
+            "forspec": ForSpec.from_cst,
+            "functioncall": Call.from_cst,
+            "id": Id.from_cst,
+            "ifspec": IfSpec.from_cst,
+            "implicit_plus": Binary.from_cst,
+            "import": Import.from_cst,
+            "importstr": Import.from_cst,
+            "indexing": Slice.from_cst,
+            "local_bind": Local.from_cst,
+            "named_argument": Arg.from_cst,
+            "number": Num.from_cst,
+            "object": dispatch_object,
+            "param": Param.from_cst,
+            "parenthesis": skip_paren,
+            "self": Self.from_cst,
+            "string": Str.from_cst,
+            "super": Super.from_cst,
+            "true": Bool.from_cst,
+        }
+
+        constructor = dispatch.get(node.type, Unknown.from_cst)
+
+        try:
+            return constructor(uri, node)
+        except Exception:
+            return Unknown.from_cst(uri, node)
+
+    def to(self, expect_type: Type[ASTType]) -> ASTType:
+        if not isinstance(self, expect_type):
+            raise TypeError(
+                f"Expected {expect_type.__name__}, but got {type(self).__name__}"
+            )
+
+        return cast(ASTType, self)
+
+    @property
+    def pretty_tree(self) -> str:
+        return str(PrettyAST(self))
+
+
+ESCAPE_TABLE: dict[int, str] = str.maketrans(
+    {"\n": r"\n", "\t": r"\t", "\r": r"\r", '"': r"\""}
+)
+
+
+def escape(s: str, size: int = 50) -> str:
+    escaped = s[0:size].translate(ESCAPE_TABLE)
+    postfix = "" if len(s) <= size else f"[{len(s) - size} characters]"
+    return f'"{escaped}{postfix}"'
+
+
+@D.dataclass
+class PrettyAST(PrettyTree):
+    """A class for pretty-printing a Jsonnet AST."""
+
+    node: Any
+    label: str | None = None
+
+    def node_text(self) -> str:
+        match self.node:
+            case Document() as doc:
+                # For the top-level `Document` node, prints the full location with URI.
+                repr = f"{doc.__class__.__name__} [{doc.location}]"
+            case AST() as ast:
+                # For all other nodes, only prints the range.
+                repr = f"{ast.__class__.__name__} [{ast.location.range}]"
+            case _, *_:
+                # For lists, print a placeholder as all the elements are printed
+                # separately as child nodes.
+                repr = "[...]"
+            case str():
+                # Escapes (and truncates) strings, which can potentially be multi-line.
+                repr = escape(self.node)
+            case _:
+                # Falls back to `__str__` for everything else.
+                repr = str(self.node)
+
+        # Prepends the label, if any.
+        return repr if self.label is None else f"{self.label}={repr}"
+
+    def children(self) -> list["PrettyTree"]:
+        match self.node:
+            case AST() as ast:
+                return [
+                    PrettyAST(getattr(ast, f.name), f.name)
+                    for f in D.fields(ast)
+                    if f.name != "location"
+                ]
+            case list() as array if (size := len(array)) > 0:
+                return [PrettyAST(array[i], f"[{i}]") for i in range(size)]
+            case _:
+                return []
+
+    def __repr__(self):
+        return super().__repr__()
+
+
+@D.dataclass
+class PrettyCST(PrettyTree):
+    """A class for pretty-printing a tree-sitter CST."""
+
+    node: T.Node
+    label: str | None = None
+
+    def node_text(self) -> str:
+        if not self.node.is_named and self.node.text:
+            repr = f"{escape(self.node.text.decode())} [{range_of(self.node)}]"
+        else:
+            repr = f"{self.node.type} [{range_of(self.node)}]"
+
+        return repr if self.label is None else f"{self.label}={repr}"
+
+    def children(self) -> list["PrettyTree"]:
+        return [
+            PrettyCST(child, self.node.field_name_for_child(i))
+            for i, child in enumerate(self.node.children)
+        ]
+
+    def __repr__(self):
+        return super().__repr__()
+
+
+@D.dataclass
+class Expr(AST):
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Expr":
+        return AST.from_cst(uri, node).to(Expr)
+
+    def bin_op(self, op: "Operator", rhs: "Expr") -> "Binary":
+        return Binary(merge_locations(self, rhs), op, self, rhs)
+
+    def __add__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Plus, rhs)
+
+    def __sub__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Minus, rhs)
+
+    def __mul__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Multiply, rhs)
+
+    def __truediv__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.Divide, rhs)
+
+    def __lt__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.LT, rhs)
+
+    def __le__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.LE, rhs)
+
+    def __gt__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.GT, rhs)
+
+    def __ge__(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.GE, rhs)
+
+    def eq(self, rhs: object) -> "Binary":
+        assert isinstance(rhs, Expr)
+        return self.bin_op(Operator.Eq, rhs)
+
+    def not_eq(self, rhs: "Expr") -> "Binary":
+        return self.bin_op(Operator.NotEq, rhs)
+
+
+@D.dataclass
+class Self(Expr):
+    def __post_init__(self):
+        self.scope: Scope | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Self":
+        assert node.type == "self"
+        return Self(location_of(uri, node))
+
+
+@D.dataclass
+class Super(Expr):
+    def __post_init__(self):
+        self.scope: Scope | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Super":
+        assert node.type == "super"
+        return Super(location_of(uri, node))
+
+
+@D.dataclass
+class Document(Expr):
+    body: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Document":
+        assert node.type == "document"
+        body, *_ = strip_comments(node.named_children)
+        return Document(location_of(uri, node), Expr.from_cst(uri, body))
+
+
+@D.dataclass
+class Id(Expr):
+    name: str
+    is_variable: bool = True
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Id":
+        assert node.type == "id"
+        assert node.text is not None
+        return Id(location_of(uri, node), node.text.decode())
+
+    def bind(self, value: Expr) -> "Bind":
+        return Bind(merge_locations(self, value), self, value)
+
+    def arg(self, value: Expr) -> "Arg":
+        return Arg(merge_locations(self, value), value, self)
+
+    def var(self, is_variable: bool) -> "Id":
+        return Id(self.location, self.name, is_variable)
+
+
+@D.dataclass
+class Num(Expr):
+    value: float
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Num":
+        assert node.type == "number"
+        assert node.text is not None
+        return Num(location_of(uri, node), float(node.text.decode()))
+
+
+@D.dataclass
+class Str(Expr):
+    raw: str
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Str":
+        assert node.type == "string"
+
+        _, content, _ = node.named_children
+        assert content.text is not None
+
+        return Str(
+            location=location_of(uri, node),
+            # The raw string content before escaping or indentations are handled.
+            raw=content.text.decode(),
+        )
+
+
+@D.dataclass
+class Bool(Expr):
+    value: bool
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Bool":
+        assert node.type in ["true", "false"]
+        assert node.text is not None
+        return Bool(location_of(uri, node), node.text.decode() == "true")
+
+
+@D.dataclass
+class Array(Expr):
+    values: list[Expr]
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Array":
+        assert node.type == "array"
+        return Array(
+            location=location_of(uri, node),
+            values=[
+                Expr.from_cst(uri, child)
+                for child in strip_comments(node.named_children)
+            ],
+        )
+
+
+class Operator(StrEnum):
+    Multiply = "*"
+    Divide = "/"
+    Modulus = "%"
+
+    Plus = "+"
+    Minus = "-"
+
+    ShiftLeft = "<<"
+    ShiftRight = ">>"
+
+    LT = "<"
+    LE = "<="
+    GT = ">"
+    GE = ">="
+    In = "in"
+
+    Eq = "=="
+    NotEq = "!="
+
+    BitAnd = "&"
+    BitXor = "^"
+    BitOr = "|"
+    And = "&&"
+    Or = "||"
+
+
+@D.dataclass
+class Binary(Expr):
+    op: Operator
+    lhs: Expr
+    rhs: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Binary":
+        assert node.type in ["binary", "implicit_plus"]
+
+        match node.type:
+            case "binary":
+                lhs, op, rhs, *_ = strip_comments(node.named_children)
+                assert op.text is not None
+                operator = Operator(op.text.decode())
+            case _:
+                lhs, rhs, *_ = strip_comments(node.named_children)
+                operator = Operator.Plus
+
+        return Binary(
+            location=location_of(uri, node),
+            op=operator,
+            lhs=Expr.from_cst(uri, lhs),
+            rhs=Expr.from_cst(uri, rhs),
+        )
+
+
+@D.dataclass
+class Bind(AST):
+    id: Id
+    value: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Bind":
+        assert node.type == "bind"
+
+        children = strip_comments(node.named_children)
+
+        if (fn_name := node.child_by_field_name("function")) is not None:
+            maybe_params = maybe(node.child_by_field_name("params"))
+            first_body, *_ = strip_comments(node.children_by_field_name("body"))
+
+            fn = Fn(
+                location=location_of(uri, node),
+                params=[
+                    Param.from_cst(uri, param)
+                    for params in maybe_params
+                    for param in strip_comments(params.named_children)
+                ],
+                body=Expr.from_cst(uri, first_body),
+            )
+
+            return Bind(
+                location=fn.location,
+                id=Id.from_cst(uri, fn_name),
+                value=fn,
+            )
+        else:
+            id, value, *_ = children
+            return Bind(
+                location=location_of(uri, node),
+                id=Id.from_cst(uri, id),
+                value=Expr.from_cst(uri, value),
+            )
+
+
+@D.dataclass
+class Local(Expr):
+    binds: list[Bind]
+    body: Expr
+
+    def __post_init__(self):
+        self.scope: Scope | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Local":
+        assert node.type == "local_bind"
+
+        # Skips the first node, which is the "local" keyword.
+        _, *children = strip_comments(node.named_children)
+
+        binds, body = [], []
+        for child in children:
+            (binds if child.type == "bind" else body).append(child)
+
+        return Local(
+            location=location_of(uri, node),
+            binds=[Bind.from_cst(uri, bind) for bind in binds],
+            body=Expr.from_cst(uri, body[0]),
+        )
+
+
+@D.dataclass
+class Param(AST):
+    id: Id
+    default: Expr | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Param":
+        assert node.type == "param"
+
+        children = strip_comments(node.named_children)
+        assert 1 <= len(children) <= 2
+
+        id, *maybe_default = children
+        return Param(
+            location=location_of(uri, node),
+            id=Id.from_cst(uri, id),
+            default=head_or_none(Expr.from_cst(uri, value) for value in maybe_default),
+        )
+
+
+@D.dataclass
+class Fn(Expr):
+    params: list[Param]
+    body: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Fn":
+        assert node.type == "anonymous_function"
+        first, *rest = strip_comments(node.named_children)
+
+        match first, rest:
+            case _, (body, *_) if first.type == "params":
+                params = [
+                    Param.from_cst(uri, param)
+                    for param in strip_comments(first.named_children)
+                ]
+            case body, *_:
+                params = []
+
+        return Fn(
+            location=location_of(uri, node),
+            params=params,
+            body=Expr.from_cst(uri, body),
+        )
+
+
+@D.dataclass
+class Arg(AST):
+    value: Expr
+    id: Id | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Arg":
+        if node.type == "named_argument":
+            name, value = strip_comments(node.named_children)
+
+            return Arg(
+                location=location_of(uri, node),
+                value=Expr.from_cst(uri, value),
+                id=Id.from_cst(uri, name),
+            )
+        else:
+            return Arg(
+                location=location_of(uri, node),
+                value=Expr.from_cst(uri, node),
+            )
+
+
+@D.dataclass
+class Call(Expr):
+    fn: Expr
+    args: list[Arg]
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Call":
+        assert node.type == "functioncall"
+
+        children = strip_comments(node.named_children)
+        assert len(children) >= 1
+
+        fn, *maybe_args = children
+
+        return Call(
+            location=location_of(uri, node),
+            fn=Expr.from_cst(uri, fn),
+            args=[
+                Arg.from_cst(uri, arg)
+                for args in maybe_args
+                for arg in strip_comments(args.named_children)
+            ],
+        )
+
+
+@D.dataclass
+class ForSpec(AST):
+    id: Id
+    expr: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "ForSpec":
+        assert node.type == "forspec"
+        id, expr = strip_comments(node.named_children)
+
+        return ForSpec(
+            location_of(uri, node),
+            Id.from_cst(uri, id),
+            Expr.from_cst(uri, expr),
+        )
+
+
+@D.dataclass
+class IfSpec(AST):
+    condition: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "IfSpec":
+        assert node.type == "ifspec"
+        [child] = strip_comments(node.named_children)
+        return IfSpec(location_of(uri, node), condition=Expr.from_cst(uri, child))
+
+
+@D.dataclass
+class ListComp(Expr):
+    expr: Expr
+    for_spec: ForSpec
+    comp_spec: list[ForSpec | IfSpec]
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "ListComp":
+        assert node.type == "forloop"
+
+        children = strip_comments(node.named_children)
+        assert len(children) >= 2
+
+        expr, for_spec, *maybe_comp_spec = children
+        return ListComp(
+            location=location_of(uri, node),
+            expr=Expr.from_cst(uri, expr),
+            for_spec=ForSpec.from_cst(uri, for_spec),
+            comp_spec=[
+                ForSpec.from_cst(uri, spec)
+                if spec.type == "forspec"
+                else IfSpec.from_cst(uri, spec)
+                for comp_spec in maybe_comp_spec
+                for spec in strip_comments(comp_spec.named_children)
+            ],
+        )
+
+
+@D.dataclass
+class Import(Expr):
+    type: str
+    path: Str
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Import":
+        assert node.type in ["import", "importstr"]
+
+        [path] = strip_comments(node.named_children)
+        return Import(
+            location_of(uri, node),
+            node.type,
+            Str.from_cst(uri, path),
+        )
+
+
+@D.dataclass
+class Assert(AST):
+    condition: Expr
+    message: Expr | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Assert":
+        assert node.type == "assert"
+
+        children = strip_comments(node.named_children)
+        assert 1 <= len(children) <= 2
+
+        condition, *maybe_message = children
+
+        match maybe_message:
+            case child, *_:
+                message = Expr.from_cst(uri, child)
+            case _:
+                message = None
+
+        return Assert(
+            location_of(uri, node),
+            condition=Expr.from_cst(uri, condition),
+            message=message,
+        )
+
+
+@D.dataclass
+class AssertExpr(Expr):
+    assertion: Assert
+    body: Expr
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Expr":
+        # An `AssertExpr` is an expression consisting of an assertion followed by an
+        # expression. Ideally, one expression should map to one `Expr` node and one
+        # tree-sitter node. However, `AssertExpr` breaks this nice property.
+        #
+        # Consider the following assert expression:
+        #
+        #   assert true;
+        #   assert true;
+        #   x + 1
+        #
+        # If tree-sitter returns the following tree, it would be straightforward to
+        # parse:
+        #
+        #   <assert_expr>
+        #       <assert>
+        #           <true>
+        #       <assert_expr>
+        #           <assert>
+        #               <true>
+        #           <binary>
+        #               left: <id>
+        #               operator: <additive>
+        #               right: <id>
+        #
+        # However, `tree-sitter-jsonnet` explicitly hides the top node by prefixing the
+        # rule name with an underscore (`_assert_expr` instead of `assert_expr`), which
+        # forces the parser to return a forest of trees:
+        #
+        #   <assert>
+        #       <true>
+        #   <assert>
+        #       <true>
+        #   <binary>
+        #       left: <id>
+        #       operator: <additive>
+        #       right: <id>
+        #
+        # This unnecessarily complicates the parsing logic, because an `Expr` node may
+        # map to one or more tree-sitter nodes.
+
+        def named_siblings(node: T.Node) -> Iterator[T.Node]:
+            sibling = node.next_named_sibling
+            while sibling is not None:
+                yield sibling
+                sibling = sibling.next_named_sibling
+
+        # Finds the first non-comment sibling named node. This is the first node of the
+        # body expression.
+        no_comments = dropwhile(
+            lambda sibling: sibling.is_extra,
+            named_siblings(node),
+        )
+
+        assertion = Assert.from_cst(uri, node)
+        body = Expr.from_cst(uri, next(no_comments))
+
+        return AssertExpr(merge_locations(assertion, body), assertion, body)
+
+
+@D.dataclass
+class FieldKey(AST):
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "FieldKey":
+        assert node.type == "fieldname"
+
+        location = location_of(uri, node)
+        head, *tail = strip_comments(node.children)
+        assert head.text is not None
+
+        if head.text.decode() == "[":
+            e, *_ = tail
+            return DynamicKey(location, Expr.from_cst(uri, e))
+        elif head.type == "id":
+            return FixedKey(location, Id.from_cst(uri, head).var(False))
+        else:
+            return FixedKey(location, Str.from_cst(uri, head))
+
+
+@D.dataclass
+class FixedKey(FieldKey):
+    id: Id | Str
+
+
+@D.dataclass
+class DynamicKey(FieldKey):
+    expr: Expr
+
+
+class Visibility(StrEnum):
+    Default = ":"
+    Hidden = "::"
+    Forced = ":::"
+
+
+@D.dataclass
+class Field(AST):
+    key: FieldKey
+    value: Expr
+    visibility: Visibility = Visibility.Default
+    inherited: bool = False
+
+    def __post_init__(self):
+        self.enclosing_obj: Object | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Field":
+        assert node.type == "field"
+        children = strip_comments(node.children)
+
+        if len(node.children_by_field_name("function")) == 0:
+            key, plus_or_vis, *rest = children
+
+            match plus_or_vis:
+                case plus if plus.text == b"+":
+                    vis, value, *_ = rest
+                    assert vis.text is not None
+                    return Field(
+                        location=location_of(uri, node),
+                        key=FieldKey.from_cst(uri, key),
+                        value=Expr.from_cst(uri, value),
+                        visibility=Visibility(vis.text.decode()),
+                        inherited=True,
+                    )
+                case vis:
+                    assert vis.text is not None
+                    value, *_ = rest
+                    return Field(
+                        location=location_of(uri, node),
+                        key=FieldKey.from_cst(uri, key),
+                        value=Expr.from_cst(uri, value),
+                        visibility=Visibility(vis.text.decode()),
+                        inherited=False,
+                    )
+        else:
+            key, _, params, _, vis, body, *_ = children
+            assert vis.text is not None
+            return Field(
+                location=location_of(uri, node),
+                key=FieldKey.from_cst(uri, key),
+                value=Fn(
+                    location_of(uri, node),
+                    params=[
+                        Param.from_cst(uri, param)
+                        for param in strip_comments(params.named_children)
+                    ],
+                    body=Expr.from_cst(uri, body),
+                ),
+                visibility=Visibility(vis.text.decode()),
+            )
+
+
+@D.dataclass
+class Object(Expr):
+    binds: list[Bind] = D.field(default_factory=list)
+    assertions: list[Assert] = D.field(default_factory=list)
+    fields: list[Field] = D.field(default_factory=list)
+
+    def __post_init__(self):
+        self.var_scope: Scope | None = None
+        self.super_scope: Scope | None = None
+        self.self_scope: Scope | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Object":
+        assert node.type == "object"
+
+        binds = []
+        assertions = []
+        fields = []
+
+        for member in strip_comments(node.named_children):
+            assert member.type == "member"
+            head, *_ = strip_comments(member.named_children)
+            match head.type:
+                case "objlocal":
+                    _, bind, *_ = strip_comments(head.named_children)
+                    binds.append(Bind.from_cst(uri, bind))
+                case "assert":
+                    assertions.append(Assert.from_cst(uri, head))
+                case "field":
+                    fields.append(Field.from_cst(uri, head))
+
+        return Object(location_of(uri, node), binds, assertions, fields)
+
+
+@D.dataclass
+class ObjComp(Expr):
+    binds: list[Bind]
+    field: Field
+    for_spec: ForSpec
+    comp_spec: list[ForSpec | IfSpec] = D.field(default_factory=list)
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "ObjComp":
+        assert node.type == "objforloop"
+        field, for_spec, *maybe_comp_spec = node.named_children
+
+        return ObjComp(
+            location=location_of(uri, node),
+            binds=[],
+            field=Field.from_cst(uri, field),
+            for_spec=ForSpec.from_cst(uri, for_spec),
+            comp_spec=[
+                ForSpec.from_cst(uri, spec)
+                if spec.type == "forspec"
+                else IfSpec.from_cst(uri, spec)
+                for comp_spec in maybe_comp_spec
+                for spec in strip_comments(comp_spec.named_children)
+            ],
+        )
+
+
+@D.dataclass
+class FieldAccess(Expr):
+    obj: Expr
+    field: Id
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "FieldAccess":
+        assert node.type in ["fieldaccess", "fieldaccess_super"]
+        expr, field = strip_comments(node.named_children)
+        return FieldAccess(
+            location=location_of(uri, node),
+            obj=Expr.from_cst(uri, expr),
+            field=Id.from_cst(uri, field).var(False),
+        )
+
+
+@D.dataclass
+class Slice(Expr):
+    array: Expr
+    begin: Expr
+    end: Expr | None = None
+    step: Expr | None = None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Slice":
+        assert node.type == "indexing"
+        expr, begin, *rest = strip_comments(node.named_children)
+        match rest:
+            case [end, step]:
+                end = Expr.from_cst(uri, end)
+                step = Expr.from_cst(uri, step)
+            case [end]:
+                end = Expr.from_cst(uri, end)
+                step = None
+            case _:
+                end = None
+                step = None
+
+        return Slice(
+            location=location_of(uri, node),
+            array=Expr.from_cst(uri, expr),
+            begin=Expr.from_cst(uri, begin),
+            end=end,
+            step=step,
+        )
+
+
+@D.dataclass
+class If(Expr):
+    condition: Expr
+    consequence: Expr
+    alternative: Expr | None
+
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "If":
+        assert node.type == "conditional"
+        condition, consequence, *maybe_alternative = strip_comments(node.named_children)
+        return If(
+            location=location_of(uri, node),
+            condition=Expr.from_cst(uri, condition),
+            consequence=Expr.from_cst(uri, consequence),
+            alternative=head_or_none(
+                Expr.from_cst(uri, alternative) for alternative in maybe_alternative
+            ),
+        )
+
+
+@D.dataclass
+class Unknown(Expr):
+    @staticmethod
+    def from_cst(uri: str, node: T.Node) -> "Expr":
+        return Unknown(location_of(uri, node))
+
+
+class Visitor:
+    def visit(self, tree: Expr):
+        match tree:
+            case Document() as e:
+                self.visit_document(e)
+            case Id() as e:
+                self.visit_id(e)
+            case Str() as e:
+                self.visit_str(e)
+            case Num() as e:
+                self.visit_num(e)
+            case Bool() as e:
+                self.visit_bool(e)
+            case Array() as e:
+                self.visit_array(e)
+            case Binary() as e:
+                self.visit_binary(e)
+            case Local() as e:
+                self.visit_local(e)
+            case Fn() as e:
+                self.visit_fn(e)
+            case Call() as e:
+                self.visit_call(e)
+            case ListComp() as e:
+                self.visit_list_comp(e)
+            case Import() as e:
+                self.visit_import(e)
+            case AssertExpr() as e:
+                self.visit_assert_expr(e)
+            case If() as e:
+                self.visit_if(e)
+            case Object() as e:
+                self.visit_object(e)
+            case FieldAccess() as e:
+                self.visit_field_access(e)
+            case Self() as e:
+                self.visit_self(e)
+            case Super() as e:
+                self.visit_super(e)
+
+    def visit_document(self, e: Document):
+        self.visit(e.body)
+
+    def visit_id(self, e: Id):
+        del e
+
+    def visit_str(self, e: Str):
+        del e
+
+    def visit_num(self, e: Num):
+        del e
+
+    def visit_bool(self, e: Bool):
+        del e
+
+    def visit_array(self, e: Array):
+        for v in e.values:
+            self.visit(v)
+
+    def visit_binary(self, e: Binary):
+        self.visit(e.lhs)
+        self.visit(e.rhs)
+
+    def visit_local(self, e: Local):
+        for b in e.binds:
+            self.visit_bind(b)
+        self.visit(e.body)
+
+    def visit_bind(self, b: Bind):
+        self.visit_id(b.id)
+        self.visit(b.value)
+
+    def visit_fn(self, e: Fn):
+        for p in e.params:
+            self.visit_param(p)
+        self.visit(e.body)
+
+    def visit_param(self, p: Param):
+        self.visit_id(p.id)
+        if p.default is not None:
+            self.visit(p.default)
+
+    def visit_call(self, e: Call):
+        self.visit(e.fn)
+        for a in e.args:
+            self.visit_arg(a)
+
+    def visit_arg(self, a: Arg):
+        if a.id is not None:
+            self.visit(a.id)
+        self.visit(a.value)
+
+    def visit_list_comp(self, e: ListComp):
+        self.visit_for_spec(e.for_spec)
+
+        for s in e.comp_spec:
+            match s:
+                case ForSpec() as f:
+                    self.visit_for_spec(f)
+                case IfSpec() as i:
+                    self.visit_if_spec(i)
+
+        self.visit(e.expr)
+
+    def visit_for_spec(self, s: ForSpec):
+        self.visit(s.expr)
+        self.visit_id(s.id)
+
+    def visit_if_spec(self, s: IfSpec):
+        self.visit(s.condition)
+
+    def visit_import(self, e: Import):
+        self.visit_str(e.path)
+
+    def visit_assert_expr(self, e: AssertExpr):
+        self.visit_assert(e.assertion)
+        self.visit(e.body)
+
+    def visit_assert(self, a: Assert):
+        self.visit(a.condition)
+        if a.message is not None:
+            self.visit(a.message)
+
+    def visit_if(self, e: If):
+        self.visit(e.condition)
+        self.visit(e.consequence)
+        if e.alternative is not None:
+            self.visit(e.alternative)
+
+    def visit_object(self, e: Object):
+        for f in e.fields:
+            match f.key:
+                case FixedKey() as key:
+                    self.visit(key.id)
+                case DynamicKey() as key:
+                    self.visit(key.expr)
+
+            self.visit_field_key(e, f)
+
+        for b in e.binds:
+            self.visit_bind(b)
+
+        for a in e.assertions:
+            self.visit_assert(a)
+
+        for f in e.fields:
+            self.visit_field_value(e, f)
+
+    def visit_field_key(self, e: Object, f: Field):
+        del e, f
+
+    def visit_field_value(self, e: Object, f: Field):
+        del e, f
+
+    def visit_field_access(self, e: FieldAccess):
+        self.visit(e.obj)
+        self.visit(e.field)
+
+    def visit_slice(self, e: Slice):
+        self.visit(e.array)
+        self.visit(e.begin)
+
+        if e.end is not None:
+            self.visit(e.end)
+
+        if e.step is not None:
+            self.visit(e.step)
+
+    def visit_self(self, e: Self):
+        del e
+
+    def visit_super(self, e: Super):
+        del e
+
+
+def position_of(point: T.Point) -> L.Position:
+    return L.Position(point.row, point.column)
+
+
+def range_of(node: T.Node) -> L.Range:
+    return L.Range(
+        position_of(node.range.start_point),
+        position_of(node.range.end_point),
+    )
+
+
+def location_of(uri: str, node: T.Node) -> L.Location:
+    return L.Location(uri, range_of(node))
+
+
+RangeLike = L.Range | T.Range | T.Node | AST
+
+
+def merge_ranges(lhs: RangeLike, rhs: RangeLike) -> L.Range:
+    match lhs:
+        case L.Range():
+            start = lhs.start
+        case T.Range() as r:
+            start = position_of(r.start_point)
+        case T.Node() as n:
+            start = position_of(n.start_point)
+        case AST():
+            start = lhs.location.range.start
+
+    match rhs:
+        case L.Range():
+            end = rhs.end
+        case T.Range() as r:
+            end = position_of(r.end_point)
+        case T.Node() as n:
+            end = position_of(n.end_point)
+        case AST():
+            end = rhs.location.range.end
+
+    assert start < end or end == start
+
+    return L.Range(start, end)
+
+
+LocationLike = L.Location | AST
+
+
+def merge_locations(lhs: LocationLike, rhs: LocationLike) -> L.Location:
+    if isinstance(lhs, AST):
+        lhs = lhs.location
+
+    if isinstance(rhs, AST):
+        rhs = rhs.location
+
+    assert lhs.uri == rhs.uri, dedent(
+        f"""\
+        Cannot merge two locations from different documents:
+        * {lhs.uri}
+        * {rhs.uri}
+        """
+    )
+
+    return L.Location(lhs.uri, merge_ranges(lhs.range, rhs.range))
+
+
+@D.dataclass
+class Binding:
+    scope: "Scope"
+    name: str
+    location: L.Location
+    value: AST | None = None
+
+
+@D.dataclass
+class Scope:
+    bindings: list[Binding] = D.field(default_factory=list)
+    parent: "Scope | None" = None
+    children: list["Scope"] = D.field(default_factory=list)
+
+    def bind(self, name: str, location: L.Location, value: AST | None = None):
+        self.bindings.insert(0, Binding(self, name, location, value))
+
+    def get(self, id: Id) -> Binding | None:
+        return next(
+            iter(b for b in self.bindings if b.name == id.name),
+            None if self.parent is None else self.parent.get(id),
+        )
+
+    def nest(self) -> "Scope":
+        child = Scope([], parent=self)
+        self.children.append(child)
+        return child
+
+    @property
+    def pretty_tree(self) -> str:
+        return str(PrettyScope(self))
+
+    @staticmethod
+    def empty() -> "Scope":
+        return Scope()
+
+
+@D.dataclass
+class PrettyScope(PrettyTree):
+    """A class for pretty-printing a scope."""
+
+    node: Any
+    label: str | None = None
+
+    def node_text(self) -> str:
+        match self.node:
+            case Scope():
+                repr = "Scope"
+            case Binding(_, name, _, None):
+                repr = name
+            case Binding(_, name, _, value):
+                repr = f'"{name}" <- {value.__class__.__name__}'
+            case []:
+                repr = "[]"
+            case list():
+                repr = "[...]"
+            case _:
+                repr = str(self.node)
+
+        return repr if self.label is None else f"{self.label}={repr}"
+
+    def children(self) -> list["PrettyTree"]:
+        match self.node:
+            case Scope(bindings, _, children):
+                return [
+                    PrettyScope(bindings, "bindings"),
+                    PrettyScope(children, "children"),
+                ]
+            case list() as array:
+                return [PrettyScope(value, f"[{i}]") for i, value in enumerate(array)]
+            case _:
+                return []
+
+    def __repr__(self):
+        return super().__repr__()
