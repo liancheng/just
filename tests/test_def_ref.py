@@ -5,7 +5,7 @@ import lsprotocol.types as L
 from rich.console import Console
 from rich.text import Text
 
-from just.dsl import TestDocument, TestWorkspace, side_by_side
+from .dsl import TestDocument, TestWorkspace, side_by_side
 
 
 class TestDefRef(unittest.TestCase):

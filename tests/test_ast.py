@@ -26,8 +26,9 @@ from just.ast import (
     Visibility,
     merge_locations,
 )
-from just.dsl import TestDocument
 from just.parsing import LANG_JSONNET
+
+from .dsl import TestDocument
 
 
 class TestAST(unittest.TestCase):
