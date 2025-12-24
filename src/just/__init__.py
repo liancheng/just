@@ -1,6 +1,5 @@
 import logging
 import sys
-import unittest
 from pathlib import Path
 from typing import Annotated
 
@@ -97,13 +96,20 @@ def index(
     WorkspaceIndex(workspace_root.as_uri()).sync(path.as_uri(), path.read_text())
 
 
-@app.command(context_settings=dict(allow_extra_args=True))
-def test(context: typer.Context):
+@app.command(
+    context_settings=dict(
+        allow_extra_args=True,
+        ignore_unknown_options=True,
+    )
+)
+def test():
     # Lowers the recursion limit to make debugging easier. Testing documents are short
     # and don't require too deep recursions.
-    sys.setrecursionlimit(100)
+    sys.setrecursionlimit(128)
 
-    # `unittest` requires the first argument to be the program name, while Typer strips
-    # the program (`just`) and command (`test`) names.
-    argv = ["test"] + context.args
-    unittest.main(argv=argv)
+    import unittest
+
+    unittest.main(
+        module=None,
+        argv=[sys.argv[0], "discover"],
+    )
