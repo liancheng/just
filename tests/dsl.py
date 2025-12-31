@@ -1,4 +1,4 @@
-from itertools import accumulate, chain, groupby
+from itertools import accumulate, chain
 from pathlib import Path
 
 import lsprotocol.types as L
@@ -230,41 +230,3 @@ class FakeWorkspace:
     def single_doc(doc: FakeDocument) -> "FakeWorkspace":
         root_uri = Path.from_uri(doc.uri).absolute().parent.as_uri()
         return FakeWorkspace(root_uri, [doc])
-
-    def dump_references(self):
-        rendered = []
-
-        for key, ref_locations in self.index.def_to_refs.items():
-            def_location = key.location
-            def_doc = self.docs[def_location.uri]
-            lhs = [Text.styled("Definition", "black on yellow")]
-            lhs.append(def_doc.highlight([def_location.range], "black on blue"))
-
-            rhs = [Text.styled("Reference(s)", "black on yellow")]
-            for uri, group in groupby(ref_locations, key=lambda loc: loc.uri):
-                ref_doc = self.docs[uri]
-                ref_ranges = [loc.range for loc in group]
-                rhs.append(ref_doc.highlight(ref_ranges, "black on blue"))
-
-            rendered.append(side_by_side(Text("\n").join(lhs), Text("\n").join(rhs)))
-
-        return Text("\n\n").join(rendered)
-
-    def dump_definitions(self):
-        rendered = []
-
-        for key, ref_locations in self.index.ref_to_defs.items():
-            ref_location = key.location
-            ref_doc = self.docs[ref_location.uri]
-            lhs = [Text.styled("Reference", "black on yellow")]
-            lhs.append(ref_doc.highlight([ref_location.range], "black on blue"))
-
-            rhs = [Text.styled("Definition(s)", "black on yellow")]
-            for uri, group in groupby(ref_locations, key=lambda loc: loc.uri):
-                def_doc = self.docs[uri]
-                def_ranges = [loc.range for loc in group]
-                rhs.append(def_doc.highlight(def_ranges, "black on blue"))
-
-            rendered.append(side_by_side(Text("\n").join(lhs), Text("\n").join(rhs)))
-
-        return Text("\n\n").join(rendered)

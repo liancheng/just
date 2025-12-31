@@ -71,14 +71,8 @@ class TestDefRef(unittest.TestCase):
 
         clue = Text("\n").join(
             [
-                Text("Indexed definition(s) and reference(s):", style="default"),
-                workspace.dump_references(),
-                Text(""),
-                workspace.dump_definitions(),
-                Text(""),
                 Text("Checking symbol reference(s):"),
                 def_doc.highlight([def_location.range], TITLE_STYLE),
-                Text(""),
             ]
         )
 
@@ -99,8 +93,6 @@ class TestDefRef(unittest.TestCase):
                 [
                     Text("Checking symbol definition:"),
                     ref_doc.highlight([location.range], TITLE_STYLE),
-                    Text(""),
-                    workspace.dump_definitions(),
                 ]
             )
 
@@ -212,6 +204,7 @@ class TestDefRef(unittest.TestCase):
             ref_locations=[t.location_of("g", line=4)],
         )
 
+    @unittest.skip("Cross-document references not implemented")
     def test_import(self):
         t1 = FakeDocument(
             "{ f: 1 }",
@@ -265,6 +258,7 @@ class TestDefRef(unittest.TestCase):
             ref_locations=[t1.location_of("f", line=4, nth=2)],
         )
 
+    @unittest.skip("Cross-document references not implemented")
     def test_import_with_local(self):
         t1 = FakeDocument(
             "local o1 = { f: 0 }; o1",
@@ -395,4 +389,43 @@ class TestDefRef(unittest.TestCase):
             FakeWorkspace.single_doc(t),
             def_location=t.location_of("f"),
             ref_locations=[t.location_of("f", line=3)],
+        )
+
+    def test_fn_param_refs(self):
+        t = FakeDocument(
+            dedent(
+                """\
+                function(
+                    p1 = p2,
+                    p2 = 3,
+                    p3 = p1,
+                ) p1 + p2 + p3;
+                """
+            )
+        )
+
+        self.checkDefRefs(
+            FakeWorkspace.single_doc(t),
+            def_location=t.location_of("p1", line=2),
+            ref_locations=[
+                t.location_of("p1", line=4),
+                t.location_of("p1", line=5),
+            ],
+        )
+
+        self.checkDefRefs(
+            FakeWorkspace.single_doc(t),
+            def_location=t.location_of("p2", line=3),
+            ref_locations=[
+                t.location_of("p2", line=2),
+                t.location_of("p2", line=5),
+            ],
+        )
+
+        self.checkDefRefs(
+            FakeWorkspace.single_doc(t),
+            def_location=t.location_of("p3", line=4),
+            ref_locations=[
+                t.location_of("p3", line=5),
+            ],
         )

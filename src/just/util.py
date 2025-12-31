@@ -1,8 +1,18 @@
 from typing import Iterable, TypeVar
+import dataclasses as D
 
 U = TypeVar("U")
 
+
 Maybe = tuple[U] | tuple[()]
+
+
+@D.dataclass
+class first[U]:
+    iterable: Iterable[U]
+
+    def or_else(self, default: U) -> U:
+        return next(iter(self.iterable), default)
 
 
 def maybe[U](v: U | None) -> Maybe[U]:

@@ -32,7 +32,7 @@ from just.ast import (
     Visitor,
 )
 from just.parsing import parse_jsonnet
-from just.util import maybe
+from just.util import first, head_or_none, maybe
 
 log = logging.root
 
@@ -93,6 +93,11 @@ class DocumentIndex(Visitor):
             selection_range=tree.location.range,
         )
         self.breadcrumbs = [self.root_symbol]
+
+        # For go-to-definition and find-references
+        self.ref_to_defs: LocationMap = defaultdict(list[L.Location])
+        self.def_to_refs: LocationMap = defaultdict(list[L.Location])
+
         self.visit(tree)
 
     @property
@@ -140,8 +145,23 @@ class DocumentIndex(Visitor):
 
         return ws_symbol, doc_symbol
 
-    def add_id_reference(self, ref: Expr, binding: Binding):
-        _, refs = self.workspace_index.add_reference(ref.location, binding.location)
+    def find_goto_locations(
+        self,
+        position: L.Position,
+        lookup: dict[HashableLocation, list[L.Location]],
+    ) -> list[L.Location]:
+        return first(
+            lookup[key]
+            for key in sorted(lookup.keys())
+            if key.location.range.start <= position <= key.location.range.end
+        ).or_else([])
+
+    def add_reference(self, ref: Expr, binding: Binding):
+        defs = self.ref_to_defs[HashableLocation(ref.location)]
+        refs = self.def_to_refs[HashableLocation(binding.location)]
+
+        defs.append(binding.location)
+        refs.append(ref.location)
 
         self.add_hint(
             L.InlayHint(
@@ -205,26 +225,36 @@ class DocumentIndex(Visitor):
             case Document():
                 return self.find_self_scope(t.body, Scope())
             case Id() as id:
-                for binding in maybe(scope.get(id)):
-                    for value in maybe(binding.value):
-                        return self.find_self_scope(value, binding.scope)
+                return head_or_none(
+                    self.find_self_scope(value, binding.scope)
+                    for binding in maybe(scope.get(id))
+                    for value in maybe(binding.value)
+                )
             case Field() as f:
-                for obj in maybe(f.enclosing_obj):
-                    for var_scope in maybe(obj.var_scope):
-                        return self.find_self_scope(f.value, var_scope)
+                return head_or_none(
+                    self.find_self_scope(f.value, var_scope)
+                    for obj in maybe(f.enclosing_obj)
+                    for var_scope in maybe(obj.var_scope)
+                )
             case FieldAccess() as f:
-                for parent_scope in maybe(self.find_self_scope(f.obj, scope)):
-                    for binding in maybe(parent_scope.get(f.field)):
-                        for value in maybe(binding.value):
-                            return self.find_self_scope(value, binding.scope)
+                return head_or_none(
+                    self.find_self_scope(value, binding.scope)
+                    for parent_scope in maybe(self.find_self_scope(f.obj, scope))
+                    for binding in maybe(parent_scope.get(f.field))
+                    for value in maybe(binding.value)
+                )
             case Binary(_, _, _, rhs):
                 return self.find_self_scope(rhs, self.current_var_scope)
             case Import(_, "import", path):
-                for index in maybe(self.importee_index(path.raw)):
-                    return self.find_self_scope(index.tree, index.current_var_scope)
+                return head_or_none(
+                    self.find_self_scope(index.tree, index.current_var_scope)
+                    for index in maybe(self.importee_index(path.raw))
+                )
             case Local() as l:
-                for local_scope in maybe(l.scope):
-                    return self.find_self_scope(l.body, local_scope)
+                return head_or_none(
+                    self.find_self_scope(l.body, local_scope)
+                    for local_scope in maybe(l.scope)
+                )
             case Binary(_, Operator.Plus, _, rhs):
                 return self.find_self_scope(rhs, scope)
             case Self() as e:
@@ -233,8 +263,6 @@ class DocumentIndex(Visitor):
                 return e.scope
             case _:
                 return None
-
-        return None
 
     def visit_local(self, e: Local):
         for b in e.binds:
@@ -308,7 +336,7 @@ class DocumentIndex(Visitor):
 
     def visit_id(self, e: Id):
         if e.is_variable and (binding := self.current_var_scope.get(e)) is not None:
-            self.add_id_reference(e, binding)
+            self.add_reference(e, binding)
 
     def visit_field_key(self, e: Object, f: Field):
         assert e.self_scope is not None
@@ -385,9 +413,6 @@ class DocumentIndex(Visitor):
             )
         )
 
-        for index in maybe(self.importee_index(e.path.raw)):
-            self.workspace_index.add_reference(e.path.location, index.tree.location)
-
     def visit_object(self, e: Object):
         e.var_scope = self.current_var_scope
         e.super_scope = self.current_super_scope
@@ -401,7 +426,7 @@ class DocumentIndex(Visitor):
 
         for scope in maybe(self.find_self_scope(e.obj, self.current_var_scope)):
             for binding in maybe(scope.get(e.field)):
-                self.add_id_reference(e.field, binding)
+                self.add_reference(e.field, binding)
 
     def visit_self(self, e: Self):
         e.scope = self.current_self_scope
@@ -431,68 +456,24 @@ class WorkspaceIndex:
             list[L.WorkspaceSymbol]
         )
 
-        # For go-to-definition and find-references
-        self.ref_to_defs: LocationMap = defaultdict(list[L.Location])
-        self.def_to_refs: LocationMap = defaultdict(list[L.Location])
-
-    def find_linked_locations(
-        self, uri: str, pos: L.Position, map: LocationMap
-    ) -> list[L.Location]:
-        # TODO: More efficient position-to-location search.
-
-        for key, locations in sorted(map.items(), key=lambda pair: pair[0]):
-            r = key.location.range
-            if uri == key.location.uri and r.start <= pos <= r.end:
-                return locations
-
-        return []
-
-    def add_reference(
-        self, ref_location: L.Location, def_location: L.Location
-    ) -> tuple[list[L.Location], list[L.Location]]:
-        defs = self.ref_to_defs[HashableLocation(ref_location)]
-        refs = self.def_to_refs[HashableLocation(def_location)]
-
-        defs.append(def_location)
-        refs.append(ref_location)
-
-        return defs, refs
-
     def definitions(self, uri: str, position: L.Position) -> list[L.Location]:
-        return self.find_linked_locations(uri, position, self.ref_to_defs)
+        return [
+            location
+            for doc in maybe(self.docs.get(uri))
+            for location in doc.find_goto_locations(position, doc.ref_to_defs)
+        ]
 
     def references(self, uri: str, position: L.Position) -> list[L.Location]:
-        return self.find_linked_locations(uri, position, self.def_to_refs)
+        return [
+            location
+            for doc in maybe(self.docs.get(uri))
+            for location in doc.find_goto_locations(position, doc.def_to_refs)
+        ]
 
     def sync(self, uri: str, source: str):
         cst = parse_jsonnet(source)
         doc = Document.from_cst(uri, cst)
         self.docs[uri] = DocumentIndex(self, doc)
-
-    def invalidate_location_map(self, uri: str, map: LocationMap) -> LocationMap:
-        map = defaultdict(
-            list[L.Location],
-            {
-                key: value
-                for key, value in self.ref_to_defs.items()
-                if key.location.uri != uri
-            },
-        )
-
-        for key, locations in map.items():
-            map[key] = [loc for loc in locations if loc.uri != uri]
-
-        return map
-
-    def invalidate_doc(self, uri: str):
-        self.ref_to_defs = self.invalidate_location_map(uri, self.ref_to_defs)
-        self.def_to_refs = self.invalidate_location_map(uri, self.def_to_refs)
-
-        if uri in self.workspace_symbols:
-            del self.workspace_symbols[uri]
-
-        if uri in self.docs:
-            del self.docs[uri]
 
     def get_or_sync(self, uri: str, source: str) -> DocumentIndex:
         if uri not in self.docs:
