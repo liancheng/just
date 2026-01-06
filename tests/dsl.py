@@ -224,7 +224,7 @@ class FakeWorkspace:
 
         for doc in docs:
             assert doc.uri not in self.index.docs
-            self.index.sync(doc.uri, doc.source)
+            self.index.load(doc.uri, doc.source)
 
     @staticmethod
     def single_doc(doc: FakeDocument) -> "FakeWorkspace":

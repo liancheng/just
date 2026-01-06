@@ -123,7 +123,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f: 1"),
+            def_location=t.location_of("f"),
             ref_locations=[t.location_of("f", nth=2)],
         )
 
@@ -132,7 +132,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("g: 1"),
+            def_location=t.location_of("g"),
             ref_locations=[t.location_of("g", nth=2)],
         )
 
@@ -150,7 +150,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f: 2", line=3),
+            def_location=t.location_of("f", line=3),
             ref_locations=[t.location_of("f", line=4)],
         )
 
@@ -166,7 +166,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f: 2", line=2),
+            def_location=t.location_of("f", line=2),
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
@@ -182,7 +182,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f: 1"),
+            def_location=t.location_of("f"),
             ref_locations=[t.location_of("f", line=2, nth=2)],
         )
 
@@ -200,7 +200,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("g: 3", line=3),
+            def_location=t.location_of("g", line=3),
             ref_locations=[t.location_of("g", line=4)],
         )
 
@@ -248,13 +248,13 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t1),
-            def_location=t1.location_of("f: f", line=3, nth=1),
+            def_location=t1.location_of("f", line=3, nth=1),
             ref_locations=[t1.location_of("f", line=4, nth=1)],
         )
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t1),
-            def_location=t1.location_of("f: 1", line=1),
+            def_location=t1.location_of("f", line=1, nth=2),
             ref_locations=[t1.location_of("f", line=4, nth=2)],
         )
 
@@ -284,7 +284,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f1: 1"),
+            def_location=t.location_of("f1"),
             ref_locations=[t.location_of("f1", nth=2)],
         )
 
@@ -304,7 +304,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f1: 1", line=2),
+            def_location=t.location_of("f1", line=2),
             ref_locations=[t.location_of("f1", line=5)],
         )
 
@@ -325,7 +325,7 @@ class TestDefRef(unittest.TestCase):
 
         self.checkDefRefs(
             FakeWorkspace.single_doc(t),
-            def_location=t.location_of("f1: 1", line=2),
+            def_location=t.location_of("f1", line=2),
             ref_locations=[t.location_of("f1", line=6)],
         )
 

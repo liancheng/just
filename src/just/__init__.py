@@ -93,4 +93,4 @@ def index(
         ),
     ],
 ):
-    WorkspaceIndex(workspace_root.as_uri()).sync(path.as_uri(), path.read_text())
+    WorkspaceIndex(workspace_root.as_uri()).load(path.as_uri(), path.read_text())

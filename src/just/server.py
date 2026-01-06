@@ -103,6 +103,25 @@ class DocumentIndex(Visitor):
 
         self.visit(tree)
 
+    @staticmethod
+    def load(
+        workspace: WorkspaceIndex,
+        uri_or_path: URI | Path,
+        source: str | None = None,
+    ) -> DocumentIndex:
+        match uri_or_path:
+            case Path():
+                path = uri_or_path
+                uri = path.as_uri()
+            case _:
+                uri = uri_or_path
+                path = Path.from_uri(uri)
+
+        source = source or path.read_text("utf-8")
+        cst = parse_jsonnet(source)
+        doc = Document.from_cst(uri, cst)
+        return DocumentIndex(workspace, doc)
+
     @property
     def uri(self):
         return self.tree.location.uri
@@ -162,17 +181,29 @@ class DocumentIndex(Visitor):
         defs.append(binding.location)
         refs.append(ref.location)
 
-        self.add_hint(
+        ref_doc = (
+            self
+            if ref.location.uri == self.uri
+            else self.workspace_index.get_or_load(ref.location.uri)
+        )
+
+        def_doc = (
+            self
+            if binding.location.uri == self.uri
+            else self.workspace_index.get_or_load(binding.location.uri)
+        )
+
+        ref_doc.add_hint(
             L.InlayHint(
-                position=ref.location.range.start,
+                position=ref.location.range.end,
                 label="󰁝",
             )
         )
 
         # Shows the # of references.
-        self.add_hint(
+        def_doc.add_hint(
             L.InlayHint(
-                position=binding.location.range.start,
+                position=binding.location.range.end,
                 label=f"󰁅{len(refs)}",
             )
         )
@@ -342,9 +373,9 @@ class DocumentIndex(Visitor):
 
         match f.key:
             case FixedKey(_, Id(_, name)):
-                e.self_scope.bind(name, f.location, f)
+                e.self_scope.bind(name, f.key.location, f)
             case FixedKey(_, Str(_, raw)):
-                e.self_scope.bind(raw, f.location, f)
+                e.self_scope.bind(raw, f.key.location, f)
 
         # Adds an optional inlay hint for visibility and inheritance.
         label_parts = []
@@ -385,7 +416,7 @@ class DocumentIndex(Visitor):
         index = self.workspace_index.docs.get(path.as_uri())
 
         return index or (
-            self.workspace_index.get_or_sync(
+            self.workspace_index.get_or_load(
                 uri=path.as_uri(),
                 source=path.read_text(encoding="utf-8"),
             )
@@ -460,14 +491,12 @@ class WorkspaceIndex:
             for location in doc.find_goto_locations(position, doc.def_to_refs)
         ]
 
-    def sync(self, uri: URI, source: str):
-        cst = parse_jsonnet(source)
-        doc = Document.from_cst(uri, cst)
-        self.docs[uri] = DocumentIndex(self, doc)
+    def load(self, uri: URI, source: str | None):
+        self.docs[uri] = DocumentIndex.load(self, uri, source)
 
-    def get_or_sync(self, uri: URI, source: str) -> DocumentIndex:
+    def get_or_load(self, uri: URI, source: str | None = None) -> DocumentIndex:
         if uri not in self.docs:
-            self.sync(uri, source)
+            self.load(uri, source)
         return self.docs[uri]
 
 
@@ -520,14 +549,14 @@ def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
         root = Path.from_uri(doc.uri).absolute().parent
         ls.set_workspace_root(root.as_posix(), root.as_uri())
 
-    ls.workspace_index.sync(doc.uri, doc.text)
+    ls.workspace_index.load(doc.uri, doc.text)
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: JustLanguageServer, params: L.DidChangeTextDocumentParams):
     # TODO: Patch the AST incrementally.
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    ls.workspace_index.sync(doc.uri, doc.source)
+    ls.workspace_index.load(doc.uri, doc.source)
 
 
 @server.feature(L.WORKSPACE_SYMBOL)
@@ -551,7 +580,7 @@ def workspace_symbol(ls: JustLanguageServer, _: L.WorkspaceSymbolParams):
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
 def document_symbol(ls: JustLanguageServer, params: L.DocumentColorParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    return ls.workspace_index.get_or_sync(doc.uri, doc.source).document_symbols
+    return ls.workspace_index.get_or_load(doc.uri, doc.source).document_symbols
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
@@ -567,5 +596,5 @@ def references(ls: JustLanguageServer, params: L.ReferenceParams):
 @server.feature(L.TEXT_DOCUMENT_INLAY_HINT)
 def inlay_hint(ls: JustLanguageServer, params: L.InlayHintParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    doc_index = ls.workspace_index.get_or_sync(doc.uri, doc.source)
+    doc_index = ls.workspace_index.get_or_load(doc.uri, doc.source)
     return list(doc_index.inlay_hints.values())
