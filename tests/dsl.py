@@ -5,7 +5,7 @@ import lsprotocol.types as L
 import tree_sitter as T
 from rich.text import Text
 
-from just.ast import (
+from joule.ast import (
     AST,
     Arg,
     Bool,
@@ -19,8 +19,8 @@ from just.ast import (
     Str,
     merge_locations,
 )
-from just.parsing import parse_jsonnet
-from just.server import WorkspaceIndex
+from joule.parsing import parse_jsonnet
+from joule.server import WorkspaceIndex
 
 
 def side_by_side(lhs: Text | str, rhs: Text | str) -> Text:

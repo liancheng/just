@@ -6,13 +6,13 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from just.ast import (
+from joule.ast import (
     AST,
     PrettyAST,
     PrettyCST,
 )
-from just.parsing import parse_jsonnet
-from just.server import WorkspaceIndex, server
+from joule.parsing import parse_jsonnet
+from joule.server import WorkspaceIndex, server
 
 app = typer.Typer(
     no_args_is_help=True,

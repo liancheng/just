@@ -7,9 +7,9 @@ from typing import Any, Callable, ClassVar, Iterator, cast
 import lsprotocol.types as L
 import tree_sitter as T
 
-from just.pretty import PrettyTree
-from just.typing import URI
-from just.util import head_or_none, maybe
+from joule.pretty import PrettyTree
+from joule.typing import URI
+from joule.util import head_or_none, maybe
 
 
 def strip_comments(nodes: list[T.Node]) -> list[T.Node]:

@@ -9,7 +9,7 @@ from typing import Iterator, Sequence
 import lsprotocol.types as L
 from pygls.lsp.server import LanguageServer
 
-from just.ast import (
+from joule.ast import (
     AST,
     Binary,
     Bind,
@@ -33,10 +33,10 @@ from just.ast import (
     Visibility,
     Visitor,
 )
-from just.icon import Icon
-from just.parsing import parse_jsonnet
-from just.typing import URI
-from just.util import head_or_none, maybe
+from joule.icon import Icon
+from joule.parsing import parse_jsonnet
+from joule.typing import URI
+from joule.util import head_or_none, maybe
 
 log = logging.root
 

@@ -3,7 +3,7 @@ from textwrap import dedent
 
 import tree_sitter as T
 
-from just.ast import (
+from joule.ast import (
     AST,
     Array,
     Assert,
@@ -26,7 +26,7 @@ from just.ast import (
     Visibility,
     merge_locations,
 )
-from just.parsing import LANG_JSONNET
+from joule.parsing import LANG_JSONNET
 
 from .dsl import FakeDocument
 
