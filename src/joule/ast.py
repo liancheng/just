@@ -569,7 +569,7 @@ class Call(Expr):
 @D.dataclass
 class ForSpec(AST):
     id: Id
-    expr: Expr
+    container: Expr
 
     @staticmethod
     def from_cst(uri: URI, node: T.Node) -> ForSpec:
@@ -1097,8 +1097,8 @@ class Scope:
     parent: "Scope | None" = None
     children: list["Scope"] = D.field(default_factory=list)
 
-    def bind(self, name: str, location: L.Location, value: AST | None = None):
-        self.bindings.insert(0, Binding(self, name, location, value))
+    def bind(self, name: str, location: L.Location, target: AST | None = None):
+        self.bindings.insert(0, Binding(self, name, location, target))
 
     def get(self, id: Id) -> Binding | None:
         return next(

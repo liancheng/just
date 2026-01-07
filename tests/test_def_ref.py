@@ -429,3 +429,18 @@ class TestDefRef(unittest.TestCase):
                 t.location_of("p3", line=5),
             ],
         )
+
+    def test_list_comp(self):
+        t = FakeDocument("[local y = 1; x + y for x in std.range(1, 3)]")
+
+        self.checkDefRefs(
+            FakeWorkspace.single_doc(t),
+            def_location=t.location_of("x", nth=2),
+            ref_locations=[t.location_of("x")],
+        )
+
+        self.checkDefRefs(
+            FakeWorkspace.single_doc(t),
+            def_location=t.location_of("y"),
+            ref_locations=[t.location_of("y", nth=2)],
+        )

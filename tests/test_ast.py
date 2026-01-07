@@ -356,7 +356,7 @@ class TestAST(unittest.TestCase):
                 for_spec=ForSpec(
                     location=t.location_of("for x in [1, 2]"),
                     id=t.var("x", nth=2),
-                    expr=Array(
+                    container=Array(
                         location=t.location_of("[1, 2]"),
                         values=[
                             t.num(1),
@@ -647,7 +647,7 @@ class TestAST(unittest.TestCase):
                 for_spec=ForSpec(
                     location=t.location_of("for x in [1, 2]", line=3),
                     id=t.var("x", line=3),
-                    expr=Array(
+                    container=Array(
                         location=t.location_of("[1, 2]", line=3),
                         values=[t.num(1, line=3), t.num(2, line=3)],
                     ),

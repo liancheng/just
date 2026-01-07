@@ -136,7 +136,7 @@ class Visitor:
         self.visit(e.expr)
 
     def visit_for_spec(self, s: ForSpec):
-        self.visit(s.expr)
+        self.visit(s.container)
         self.visit_id(s.id)
 
     def visit_if_spec(self, s: IfSpec):

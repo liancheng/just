@@ -381,17 +381,18 @@ class DocumentIndex(Visitor):
             self.visit(e.body)
 
     def visit_for_spec(self, s: ForSpec):
-        self.visit(s.expr)
-
-        symbol = L.DocumentSymbol(
-            name=s.id.name,
-            kind=L.SymbolKind.Variable,
-            range=s.id.location.range,
-            selection_range=s.location.range,
+        self.add_document_symbol(
+            L.DocumentSymbol(
+                name=s.id.name,
+                kind=L.SymbolKind.Variable,
+                range=s.id.location.range,
+                selection_range=s.location.range,
+            )
         )
 
-        with self.parent_symbol(symbol):
-            pass
+        self.current_var_scope.bind(s.id.name, s.id.location, s.container)
+
+        self.visit(s.container)
 
     def visit_id(self, e: Id):
         if e.is_variable and (binding := self.current_var_scope.get(e)) is not None:
