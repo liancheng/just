@@ -31,12 +31,12 @@ from joule.ast import (
     Str,
     Super,
     Visibility,
-    Visitor,
 )
 from joule.icon import Icon
 from joule.parsing import parse_jsonnet
 from joule.typing import URI
 from joule.util import head_or_none, maybe
+from joule.visitor import Visitor
 
 log = logging.root
 
@@ -256,9 +256,9 @@ class DocumentIndex(Visitor):
                 return self.find_self_scope(t.body, Scope())
             case Id():
                 return head_or_none(
-                    self.find_self_scope(value, binding.scope)
+                    self.find_self_scope(target, binding.scope)
                     for binding in maybe(scope.get(t))
-                    for value in maybe(binding.value)
+                    for target in maybe(binding.target)
                 )
             case Field():
                 return head_or_none(
@@ -268,10 +268,10 @@ class DocumentIndex(Visitor):
                 )
             case FieldAccess():
                 return head_or_none(
-                    self.find_self_scope(value, binding.scope)
+                    self.find_self_scope(target, binding.scope)
                     for parent_scope in maybe(self.find_self_scope(t.obj, scope))
                     for binding in maybe(parent_scope.get(t.field))
-                    for value in maybe(binding.value)
+                    for target in maybe(binding.target)
                 )
             case Binary(_, _, _, rhs):
                 return self.find_self_scope(rhs, self.current_var_scope)
