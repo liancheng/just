@@ -505,7 +505,7 @@ class WorkspaceIndex:
         local_defs = [
             location
             for doc in maybe(self.docs.get(uri))
-            for location in doc.find_goto_locations(position, doc.ref_to_defs)
+            for location in doc.definition(position)
         ]
 
         return local_defs
@@ -514,7 +514,7 @@ class WorkspaceIndex:
         return [
             location
             for doc in maybe(self.docs.get(uri))
-            for location in doc.find_goto_locations(position, doc.def_to_refs)
+            for location in doc.references(position)
         ]
 
     def load(self, uri: URI, source: str | None):
@@ -526,7 +526,7 @@ class WorkspaceIndex:
         return self.docs[uri]
 
 
-class JustLanguageServer(LanguageServer):
+class JouleLanguageServer(LanguageServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -535,11 +535,11 @@ class JustLanguageServer(LanguageServer):
         self.workspace_index = WorkspaceIndex(root_uri)
 
 
-server = JustLanguageServer("just", "v0.1")
+server = JouleLanguageServer("just", "v0.1")
 
 
 @server.feature(L.INITIALIZE)
-def initialize(ls: JustLanguageServer, params: L.InitializeParams):
+def initialize(ls: JouleLanguageServer, params: L.InitializeParams):
     for root_path in maybe(params.root_path):
         for root_uri in maybe(params.root_uri):
             log.info("Discovered workspace root: %s, %s", root_path, root_uri)
@@ -566,7 +566,7 @@ def initialize(ls: JustLanguageServer, params: L.InitializeParams):
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_OPEN)
-def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
+def did_open(ls: JouleLanguageServer, params: L.DidOpenTextDocumentParams):
     doc = params.text_document
 
     # If the workspace root is not yet discovered, set the root as the parent folder of
@@ -579,14 +579,14 @@ def did_open(ls: JustLanguageServer, params: L.DidOpenTextDocumentParams):
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
-def did_change(ls: JustLanguageServer, params: L.DidChangeTextDocumentParams):
+def did_change(ls: JouleLanguageServer, params: L.DidChangeTextDocumentParams):
     # TODO: Patch the AST incrementally.
     doc = ls.workspace.get_text_document(params.text_document.uri)
     ls.workspace_index.load(doc.uri, doc.source)
 
 
 @server.feature(L.WORKSPACE_SYMBOL)
-def workspace_symbol(ls: JustLanguageServer, _: L.WorkspaceSymbolParams):
+def workspace_symbol(ls: JouleLanguageServer, _: L.WorkspaceSymbolParams):
     def offsprings(symbol: L.DocumentSymbol) -> Iterator[L.DocumentSymbol]:
         return iter(
             offspring
@@ -608,23 +608,23 @@ def workspace_symbol(ls: JustLanguageServer, _: L.WorkspaceSymbolParams):
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
-def document_symbol(ls: JustLanguageServer, params: L.DocumentColorParams):
+def document_symbol(ls: JouleLanguageServer, params: L.DocumentColorParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
     return ls.workspace_index.get_or_load(doc.uri, doc.source).document_symbols
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
-def definition(ls: JustLanguageServer, params: L.DefinitionParams):
+def definition(ls: JouleLanguageServer, params: L.DefinitionParams):
     return ls.workspace_index.definitions(params.text_document.uri, params.position)
 
 
 @server.feature(L.TEXT_DOCUMENT_REFERENCES)
-def references(ls: JustLanguageServer, params: L.ReferenceParams):
+def references(ls: JouleLanguageServer, params: L.ReferenceParams):
     return ls.workspace_index.references(params.text_document.uri, params.position)
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
-def document_highlight(ls: JustLanguageServer, params: L.DocumentHighlightParams):
+def document_highlight(ls: JouleLanguageServer, params: L.DocumentHighlightParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
     doc_index = ls.workspace_index.get_or_load(doc.uri, doc.source)
 
@@ -639,21 +639,21 @@ def document_highlight(ls: JustLanguageServer, params: L.DocumentHighlightParams
 
 
 @server.feature(L.TEXT_DOCUMENT_INLAY_HINT)
-def inlay_hint(ls: JustLanguageServer, params: L.InlayHintParams):
+def inlay_hint(ls: JouleLanguageServer, params: L.InlayHintParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
     doc_index = ls.workspace_index.get_or_load(doc.uri, doc.source)
     return list(doc_index.inlay_hints.values())
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_LINK)
-def document_link(ls: JustLanguageServer, params: L.DocumentLinkParams):
+def document_link(ls: JouleLanguageServer, params: L.DocumentLinkParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
     doc_index = ls.workspace_index.get_or_load(doc.uri, doc.source)
     return doc_index.links
 
 
 @server.feature(L.TEXT_DOCUMENT_HOVER)
-def hover(ls: JustLanguageServer, params: L.HoverParams):
+def hover(ls: JouleLanguageServer, params: L.HoverParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
     doc_index = ls.workspace_index.get_or_load(doc.uri, doc.source)
     return head_or_none(
