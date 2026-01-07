@@ -138,30 +138,6 @@ class DocumentIndex(Visitor):
             case None:
                 parent.children = [symbol]
 
-    def add_symbol(
-        self,
-        name: str,
-        kind: L.SymbolKind,
-        location: L.Location,
-        selection_range: L.Range | None = None,
-    ) -> tuple[L.WorkspaceSymbol, L.DocumentSymbol]:
-        ws_symbol = L.WorkspaceSymbol(
-            location=location,
-            name=name,
-            kind=kind,
-        )
-
-        doc_symbol = L.DocumentSymbol(
-            name=name,
-            kind=kind,
-            range=location.range,
-            selection_range=selection_range or location.range,
-        )
-
-        self.add_document_symbol(doc_symbol)
-
-        return ws_symbol, doc_symbol
-
     def definition(
         self,
         position: L.Position,
@@ -340,13 +316,14 @@ class DocumentIndex(Visitor):
             case _:
                 kind = L.SymbolKind.Variable
 
-        _, doc_symbol = self.add_symbol(
+        doc_symbol = L.DocumentSymbol(
             name=b.id.name,
             kind=kind,
-            location=b.id.location,
+            range=b.id.location.range,
             selection_range=b.location.range,
         )
 
+        self.add_document_symbol(doc_symbol)
         with self.parent_symbol(doc_symbol):
             with self.var_scope(self.current_var_scope.nest()):
                 self.visit(b.value)
@@ -367,12 +344,14 @@ class DocumentIndex(Visitor):
                 self.current_var_scope.bind(p.id.name, p.id.location, p.default)
 
             for p in e.params:
-                _, doc_symbol = self.add_symbol(
-                    p.id.name,
-                    L.SymbolKind.Variable,
-                    p.id.location,
-                    p.location.range,
+                doc_symbol = L.DocumentSymbol(
+                    name=p.id.name,
+                    kind=L.SymbolKind.Variable,
+                    range=p.id.location.range,
+                    selection_range=p.location.range,
                 )
+
+                self.add_document_symbol(doc_symbol)
 
                 if p.default is not None:
                     with self.parent_symbol(doc_symbol):
@@ -470,11 +449,13 @@ class DocumentIndex(Visitor):
 
         self.hovers[LocationKey(e.path.location)] = L.Hover(importee_path)
 
-        self.add_symbol(
-            name=e.path.raw,
-            kind=L.SymbolKind.File,
-            location=e.path.location,
-            selection_range=e.location.range,
+        self.add_document_symbol(
+            L.DocumentSymbol(
+                name=e.path.raw,
+                kind=L.SymbolKind.File,
+                range=e.path.location.range,
+                selection_range=e.location.range,
+            )
         )
 
         self.add_hint(
@@ -615,7 +596,11 @@ def workspace_symbol(ls: JustLanguageServer, _: L.WorkspaceSymbolParams):
         )
 
     return [
-        symbol
+        L.WorkspaceSymbol(
+            location=L.Location(doc.uri, symbol.range),
+            name=symbol.name,
+            kind=symbol.kind,
+        )
         for doc in ls.workspace_index.docs.values()
         for top_level_symbol in doc.document_symbols
         for symbol in offsprings(top_level_symbol)
