@@ -385,8 +385,24 @@ class DocumentIndex(Visitor):
         match f.key:
             case FixedKey(_, Id(_, name)):
                 e.self_scope.bind(name, f.key.location, f)
+                self.add_document_symbol(
+                    L.DocumentSymbol(
+                        name=name,
+                        kind=L.SymbolKind.Field,
+                        range=f.key.location.range,
+                        selection_range=f.location.range,
+                    )
+                )
             case FixedKey(_, Str(_, raw)):
                 e.self_scope.bind(raw, f.key.location, f)
+                self.add_document_symbol(
+                    L.DocumentSymbol(
+                        name=raw,
+                        kind=L.SymbolKind.Field,
+                        range=f.key.location.range,
+                        selection_range=f.location.range,
+                    )
+                )
 
         # Adds an optional inlay hint for visibility and inheritance.
         label_parts = []
