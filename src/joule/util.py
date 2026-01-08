@@ -12,3 +12,7 @@ def maybe[U](v: U | None) -> Maybe[U]:
 
 def head_or_none[U](i: Iterable[U]) -> U | None:
     return next(iter(i), None)
+
+
+def head[U](i: Iterable[U]) -> U:
+    return next(iter(i))

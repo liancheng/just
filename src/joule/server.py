@@ -65,19 +65,6 @@ class LocationKey:
             )
         )
 
-    def __lt__(self, that: "LocationKey") -> bool:
-        return (
-            self.location.uri < that.location.uri
-            or self.location.uri == that.location.uri
-            and self.location.range != that.location.range
-            and (
-                that.location.range.start <= self.location.range.start
-                and self.location.range.end <= that.location.range.end
-                or self.location.range.start <= that.location.range.start
-                and self.location.range.end <= that.location.range.end
-            )
-        )
-
 
 class DocumentIndex(Visitor):
     def __init__(self, workspace_index: "WorkspaceIndex", doc: Document) -> None:
@@ -130,8 +117,8 @@ class DocumentIndex(Visitor):
 
     def add_document_symbol(self, symbol: L.DocumentSymbol):
         match (parent := self.breadcrumbs[-1]).children:
-            case list():
-                parent.children.append(symbol)
+            case list() as children:
+                children.append(symbol)
             case None:
                 parent.children = [symbol]
 
@@ -164,19 +151,18 @@ class DocumentIndex(Visitor):
     ) -> list[L.Location]:
         candidate = head_or_none(
             (node, lookup[LocationKey(node.location)])
-            for node in maybe(self.doc.narrowest_under(position))
-            if location_contains(node.location, position)
+            for node in maybe(self.doc.narrowest_node(position))
         )
 
         match candidate:
-            case None:
-                return []
             case node, locations:
                 if local:
                     locations = list(filter(lambda x: x.uri == self.uri, locations))
                 if include_current:
-                    locations = list(chain([node.location], locations))
+                    locations = locations + [node.location]
                 return locations
+            case _:
+                return []
 
     def add_reference(self, ref: Expr, binding: Binding):
         defs = self.ref_to_defs[LocationKey(ref.location)]
@@ -451,16 +437,18 @@ class DocumentIndex(Visitor):
         )
 
     def visit_import(self, e: Import):
-        importee_path = self.resolve_importee_path(e.path.raw).as_uri()
+        importee_path = self.resolve_importee_path(e.path.raw)
+        importee_uri = importee_path.as_uri()
 
-        self.links.append(
-            L.DocumentLink(
-                range=e.path.location.range,
-                target=importee_path,
+        if importee_path.exists() and importee_path.is_file():
+            self.links.append(
+                L.DocumentLink(
+                    range=e.path.location.range,
+                    target=importee_uri,
+                )
             )
-        )
 
-        self.hovers[LocationKey(e.path.location)] = L.Hover(importee_path)
+        self.hovers[LocationKey(e.path.location)] = L.Hover(importee_uri)
 
         self.add_document_symbol(
             L.DocumentSymbol(

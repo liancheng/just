@@ -1,7 +1,7 @@
 import unittest
 from textwrap import dedent
 
-from joule.util import maybe
+import lsprotocol.types as L
 import tree_sitter as T
 
 from joule.ast import (
@@ -29,6 +29,7 @@ from joule.ast import (
     merge_locations,
 )
 from joule.parsing import LANG_JSONNET
+from joule.util import head, maybe
 
 from .dsl import FakeDocument
 
@@ -682,18 +683,21 @@ class TestAST(unittest.TestCase):
     def test_narrowest_enclosing_node(self):
         t = FakeDocument("{ f: local x = 1; x }")
 
+        def find_narrowest_node(position: L.Position) -> AST:
+            return head(maybe(t.body.narrowest_node(position)))
+
         self.assertAstEqual(
-            next(iter(maybe(t.body.narrowest_under(t.start_of("x"))))),
+            find_narrowest_node(t.start_of("x")),
             t.id("x", IdKind.Var),
         )
 
         self.assertAstEqual(
-            next(iter(maybe(t.body.narrowest_under(t.start_of("="))))),
+            find_narrowest_node(t.start_of("=")),
             t.id("x", IdKind.Var).bind(t.num(1)),
         )
 
         self.assertAstEqual(
-            next(iter(maybe(t.body.narrowest_under(t.start_of("local"))))),
+            find_narrowest_node(t.start_of("local")),
             Local(
                 t.location_of("local x = 1; x"),
                 [t.id("x", IdKind.Var).bind(t.num(1))],
@@ -708,12 +712,12 @@ class TestAST(unittest.TestCase):
         )
 
         self.assertAstEqual(
-            next(iter(maybe(t.body.narrowest_under(t.end_of(";"))))),
+            find_narrowest_node(t.end_of(";")),
             local,
         )
 
         self.assertAstEqual(
-            next(iter(maybe(t.body.narrowest_under(t.end_of(":"))))),
+            find_narrowest_node(t.end_of(":")),
             Field(
                 t.location_of("f: local x = 1; x"),
                 key=FixedKey(t.location_of("f"), t.id("f", IdKind.Field)),
