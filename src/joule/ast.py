@@ -23,7 +23,7 @@ class IdKind(StrEnum):
     Field = auto()
     FieldRef = auto()
     Param = auto()
-    CallArg = auto()
+    ArgRef = auto()
 
 
 ParseCST = Callable[[str, T.Node], "AST"]
@@ -179,6 +179,10 @@ class Expr(AST):
     def tails(self) -> list[Expr]:
         return [self]
 
+    def arg(self, name: Id | None = None) -> Arg:
+        location = merge_locations(name, self) if name else self.location
+        return Arg(location, self, name)
+
     def bin_op(self, op: "Operator", rhs: "Expr") -> Binary:
         return Binary(merge_locations(self, rhs), op, self, rhs)
 
@@ -279,8 +283,9 @@ class Id(Expr):
     def bind(self, value: Expr) -> Bind:
         return Bind(merge_locations(self, value), self, value)
 
-    def arg(self, value: Expr) -> Arg:
-        return Arg(merge_locations(self, value), value, self.into(IdKind.CallArg))
+    def param(self, default: Expr | None = None) -> Param:
+        location = merge_locations(self, default) if default else self.location
+        return Param(location, self.into(IdKind.Var), default)
 
     def into(self, kind: IdKind) -> Id:
         self.kind = kind
@@ -521,7 +526,7 @@ class Param(AST):
         id, *maybe_default = children
         return Param(
             location=location_of(uri, node),
-            id=Id.from_cst(uri, id).into(IdKind.Param),
+            id=Id.from_cst(uri, id).into(IdKind.Var),
             default=head_or_none(Expr.from_cst(uri, value) for value in maybe_default),
         )
 
@@ -567,11 +572,11 @@ class Fn(Expr):
 @D.dataclass
 class Arg(AST):
     value: Expr
-    id: Id | None = None
+    name: Id | None = None
 
     @property
     def children(self) -> Iterable[AST]:
-        return chain([self.value], maybe(self.id))
+        return chain([self.value], maybe(self.name))
 
     @staticmethod
     def from_cst(uri: URI, node: T.Node) -> Arg:
@@ -581,7 +586,7 @@ class Arg(AST):
             return Arg(
                 location=location_of(uri, node),
                 value=Expr.from_cst(uri, value),
-                id=Id.from_cst(uri, name).into(IdKind.CallArg),
+                name=Id.from_cst(uri, name).into(IdKind.ArgRef),
             )
         else:
             return Arg(
@@ -750,6 +755,9 @@ class Assert(AST):
             message=message,
         )
 
+    def guard(self, body: Expr) -> AssertExpr:
+        return AssertExpr(merge_locations(self, body), self, body)
+
 
 @D.dataclass
 class AssertExpr(Expr):
@@ -827,6 +835,12 @@ class AssertExpr(Expr):
     AST.register(from_cst, "assert")
 
 
+class Visibility(StrEnum):
+    Default = ":"
+    Hidden = "::"
+    Forced = ":::"
+
+
 @D.dataclass
 class FieldKey(AST):
     @staticmethod
@@ -839,13 +853,27 @@ class FieldKey(AST):
 
         if head.text.decode() == "[":
             e, *_ = tail
-            return DynamicKey(location, Expr.from_cst(uri, e))
+            return ComputedKey(location, Expr.from_cst(uri, e))
         elif head.type == "id":
             return FixedKey(location, Id.from_cst(uri, head).into(IdKind.Field))
         else:
             return FixedKey(location, Str.from_cst(uri, head))
 
     AST.register(from_cst, "fieldname")
+
+    def with_value(
+        self,
+        value: Expr,
+        visibility: Visibility = Visibility.Default,
+        inherited: bool = False,
+    ) -> Field:
+        return Field(
+            merge_locations(self.location, value.location),
+            self,
+            value,
+            visibility,
+            inherited,
+        )
 
 
 @D.dataclass
@@ -858,18 +886,12 @@ class FixedKey(FieldKey):
 
 
 @D.dataclass
-class DynamicKey(FieldKey):
+class ComputedKey(FieldKey):
     expr: Expr
 
     @property
     def children(self) -> list[AST]:
         return [self.expr]
-
-
-class Visibility(StrEnum):
-    Default = ":"
-    Hidden = "::"
-    Forced = ":::"
 
 
 @D.dataclass

@@ -1,3 +1,4 @@
+from sys import builtin_module_names
 import unittest
 from textwrap import dedent
 
@@ -10,15 +11,8 @@ from joule.ast import (
     Assert,
     AssertExpr,
     Binary,
-    Call,
-    DynamicKey,
+    ComputedKey,
     Field,
-    FixedKey,
-    Fn,
-    ForSpec,
-    IdKind,
-    IfSpec,
-    Import,
     ListComp,
     Local,
     ObjComp,
@@ -26,7 +20,6 @@ from joule.ast import (
     Operator,
     Str,
     Visibility,
-    merge_locations,
 )
 from joule.parsing import LANG_JSONNET
 from joule.util import head, maybe
@@ -119,7 +112,7 @@ class TestAST(unittest.TestCase):
 
         self.assertAstEqual(
             t.body,
-            t.num(1),
+            t.at(t.body).num(1),
         )
 
     def test_string(self):
@@ -137,31 +130,63 @@ class TestAST(unittest.TestCase):
             )
 
     def test_paren(self):
-        t = FakeDocument("(1)")
-        self.assertAstEqual(t.body, t.num(1))
+        t = FakeDocument(
+            dedent(
+                """\
+                (1)
+                 ^1
+                """
+            )
+        )
 
-        t = FakeDocument("(assert true; 1)")
+        self.assertAstEqual(
+            t.body,
+            t.at("1").num(1),
+        )
+
+        t = FakeDocument(
+            dedent(
+                """\
+                (assert true; 1)
+                              ^value
+                        ^..^condition
+                 ^.........^assert
+                 ^............^assert_expr
+                """
+            )
+        )
+
         self.assertAstEqual(
             t.body,
             AssertExpr(
-                location=t.location_of("assert true; 1"),
+                location=t.at("assert_expr"),
                 assertion=Assert(
-                    location=t.location_of("assert true"),
-                    condition=t.boolean(True),
+                    location=t.at("assert"),
+                    condition=t.at("condition").true,
                 ),
-                body=t.num(1),
+                body=t.at("value").num(1),
             ),
         )
 
     def test_local(self):
-        t = FakeDocument("local x = 1; x")
+        t = FakeDocument(
+            dedent(
+                """\
+                local x = 1;
+                      ^var
+                          ^num
+                x
+                ^var_ref
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
             Local(
                 location=t.body.location,
-                binds=[t.var("x").bind(t.num(1))],
-                body=t.var_ref("x", nth=2),
+                binds=[t.at("var").var("x").bind(t.at("num").num(1))],
+                body=t.at("var_ref").var_ref("x"),
             ),
         )
 
@@ -170,45 +195,34 @@ class TestAST(unittest.TestCase):
             dedent(
                 """\
                 local v1 = 0;
+                      ^^v1 ^0
                 assert true;
+                ^ae1:  ^..^t1
+                ^.........^a1
                 assert true;
+                ^ae2:  ^..^t2
+                ^.........^a2
                 v1 + 2
+                     ^2
+                     ^:ae2
+                     ^:ae1
+                ^^v1_ref
                 """
             )
-        )
-
-        inner_assert_expr = AssertExpr(
-            location=merge_locations(
-                t.location_of("assert", line=3),
-                t.location_of("v1 + 2", line=4),
-            ),
-            assertion=Assert(
-                location=t.location_of("assert true", line=3),
-                condition=t.boolean(True, line=3),
-            ),
-            body=t.var_ref("v1", line=4) + t.num(2, line=4),
-        )
-
-        outer_assert_expr = AssertExpr(
-            location=merge_locations(
-                t.location_of("assert", line=2),
-                t.location_of("v1 + 2", line=4),
-            ),
-            assertion=Assert(
-                location=t.location_of("assert true", line=2),
-                condition=t.boolean(True, line=2),
-            ),
-            body=inner_assert_expr,
         )
 
         self.assertAstEqual(
             t.body,
             Local(
                 location=t.body.location,
-                binds=[
-                    t.var("v1").bind(t.num(0)),
-                ],
-                body=outer_assert_expr,
+                binds=[t.at("v1").var("v1").bind(t.at("0").num(0))],
+                body=t.at("a1")
+                .assert_(t.at("t1").true)
+                .guard(
+                    t.at("a2")
+                    .assert_(t.at("t2").true)
+                    .guard(t.at("v1_ref").var_ref("v1") + t.at("2").num(2))
+                ),
             ),
         )
 
@@ -218,51 +232,68 @@ class TestAST(unittest.TestCase):
                 """\
                 local
                     f1(x) = x + 1,
+                    ^...........^fn_f1
+                    ^^f1    ^x_ref
+                       ^x       ^1
                     f2(y, z) = y + z;
+                    ^..............^fn_f2
+                    ^^f2       ^y_ref
+                       ^y ^z       ^z_ref
                 f2(f1(3), z = 4)
+                      ^3      ^4
+                ^^f2_ref  ^z_ref2
+                   ^^f1_ref
+                ^..............^call1
+                   ^...^call2
                 """
             )
         )
 
+        bind_f1 = (
+            t.at("f1")
+            .var("f1")
+            .bind(
+                t.at("fn_f1").fn(
+                    params=[
+                        t.at("x").var("x").param(),
+                    ],
+                    body=t.at("x_ref").var_ref("x") + t.at("1").num(1),
+                )
+            )
+        )
+
+        bind_f2 = (
+            t.at("f2")
+            .var("f2")
+            .bind(
+                t.at("fn_f2").fn(
+                    params=[
+                        t.at("y").var("y").param(),
+                        t.at("z").var("z").param(),
+                    ],
+                    body=t.at("y_ref").var_ref("y") + t.at("z_ref").var_ref("z"),
+                )
+            )
+        )
+
+        call_f2 = t.at("call2").call(
+            fn=t.at("f1_ref").var_ref("f1"),
+            args=[t.at("3").num(3).arg()],
+        )
+
+        call_f1 = t.at("call1").call(
+            fn=t.at("f2_ref").var_ref("f2"),
+            args=[
+                call_f2.arg(),
+                t.at("4").num(4).arg(t.at("z_ref2").arg_ref("z")),
+            ],
+        )
+
         self.assertAstEqual(
             t.body,
-            Local(
-                location=t.body.location,
-                binds=[
-                    t.var("f1", line=2).bind(
-                        Fn(
-                            location=t.location_of("f1(x) = x + 1", line=2),
-                            params=[t.param("x", line=2)],
-                            body=t.var_ref("x", line=2, nth=2)
-                            + t.num(1, line=2, nth=2),
-                        )
-                    ),
-                    t.var("f2", line=3).bind(
-                        Fn(
-                            location=t.location_of("f2(y, z) = y + z", line=3),
-                            params=[
-                                t.param("y", line=3),
-                                t.param("z", line=3),
-                            ],
-                            body=t.var_ref("y", line=3, nth=2)
-                            + t.var_ref("z", line=3, nth=2),
-                        )
-                    ),
-                ],
-                body=Call(
-                    location=t.location_of("f2(f1(3), z = 4)", line=4),
-                    fn=t.var_ref("f2", line=4),
-                    args=[
-                        t.arg(
-                            Call(
-                                location=t.location_of("f1(3)", line=4),
-                                fn=t.var_ref("f1", line=4),
-                                args=[t.arg(t.num(3, line=4))],
-                            )
-                        ),
-                        t.arg(t.num(4, line=4), name="z", line=4),
-                    ],
-                ),
+            t.at(t.body).local(
+                binds=[bind_f1, bind_f2],
+                body=call_f1,
             ),
         )
 
@@ -271,20 +302,21 @@ class TestAST(unittest.TestCase):
             dedent(
                 """\
                 local x = 1, y = 2;
+                      ^x  ^1 ^y  ^2
                 x + y
+                ^x1 ^y1
                 """
             )
         )
 
         self.assertAstEqual(
             t.body,
-            Local(
-                location=t.body.location,
+            t.at(t.body).local(
                 binds=[
-                    t.var("x").bind(t.num(1)),
-                    t.var("y").bind(t.num(2)),
+                    t.at("x").var("x").bind(t.at("1").num(1)),
+                    t.at("y").var("y").bind(t.at("2").num(2)),
                 ],
-                body=t.var_ref("x", line=2) + t.var_ref("y", line=2),
+                body=t.at("x1").var_ref("x") + t.at("y1").var_ref("y"),
             ),
         )
 
@@ -297,212 +329,285 @@ class TestAST(unittest.TestCase):
         )
 
     def test_array(self):
-        t = FakeDocument("[1, true, /* ! */ '3']")
+        t = FakeDocument(
+            dedent(
+                """\
+                [1, true, /* ! */ '3']
+                 ^1 ^..^t         ^.^s
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
             Array(
                 location=t.body.location,
                 values=[
-                    t.num(1),
-                    t.boolean(True),
-                    t.str("3", literal="'3'"),
+                    t.at("1").num(1),
+                    t.at("t").true,
+                    t.at("s").str("3"),
                 ],
             ),
         )
 
     def test_binary(self):
         for op in Operator:
-            t = FakeDocument(f"a /*!*/ {op.value} /*!*/ b")
+            t = FakeDocument(
+                dedent(
+                    f"""\
+                    a /* ! */
+                    ^a
+                    {op.value}
+                    /* ! */ b
+                            ^b
+                    """
+                )
+            )
 
             self.assertAstEqual(
                 t.body,
-                t.var_ref("a").bin_op(op, t.var_ref("b")),
+                t.at("a").var_ref("a").bin_op(op, t.at("b").var_ref("b")),
             )
 
     def test_implicit_plus(self):
-        t = FakeDocument("a {}")
+        t = FakeDocument(
+            dedent(
+                """\
+                a {}
+                ^a
+                  ^^o
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            t.var_ref("a") + Object(t.location_of("{}")),
+            t.at("a").var_ref("a") + Object(t.at("o")),
         )
 
     def test_binary_precedences(self):
-        t = FakeDocument("a + b * c")
+        t = FakeDocument(
+            dedent(
+                """\
+                a + b * c
+                ^a  ^b  ^c
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            t.var_ref("a") + (t.var_ref("b") * t.var_ref("c")),
+            t.at("a").var_ref("a") + (t.at("b").var_ref("b") * t.at("c").var_ref("c")),
         )
 
-        t = FakeDocument("(a + b) * c")
+        t = FakeDocument(
+            dedent(
+                """\
+                (a + b) * c
+                 ^a  ^b   ^c
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
             Binary(
                 t.body.location,
                 op=Operator.Multiply,
-                lhs=t.var_ref("a") + t.var_ref("b"),
-                rhs=t.var_ref("c"),
+                lhs=t.at("a").var_ref("a") + t.at("b").var_ref("b"),
+                rhs=t.at("c").var_ref("c"),
             ),
         )
 
     def test_list_comp(self):
-        t = FakeDocument("[x for x in [1, 2] if x > 1]")
+        t = FakeDocument(
+            dedent(
+                """\
+                [x for x in [1, 2] if x > 3]
+                             ^1 ^2        ^3
+                 ^x1   ^x   ^....^arr ^x2
+                                   ^......^if
+                   ^.............^for
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
             ListComp(
                 location=t.body.location,
-                expr=t.var_ref("x"),
-                for_spec=ForSpec(
-                    location=t.location_of("for x in [1, 2]"),
-                    id=t.var("x", nth=2),
-                    container=Array(
-                        location=t.location_of("[1, 2]"),
-                        values=[
-                            t.num(1),
-                            t.num(2),
-                        ],
+                expr=t.at("x1").var_ref("x"),
+                for_spec=t.at("for").for_(
+                    t.at("x").var("x"),
+                    t.at("arr").array(
+                        t.at("1").num(1),
+                        t.at("2").num(2),
                     ),
                 ),
                 comp_spec=[
-                    IfSpec(
-                        location=t.location_of("if x > 1"),
-                        condition=t.var_ref("x", nth=3) > t.num(1, nth=2),
-                    ),
+                    t.at("if").if_(t.at("x2").var_ref("x") > t.at("3").num(3)),
                 ],
             ),
         )
 
     def test_fn(self):
-        t = FakeDocument("function(x, y = 2) x + y")
+        t = FakeDocument(
+            dedent(
+                """\
+                function(x, y = 2) x + y
+                         ^x ^y  ^2 ^x1 ^y1
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            Fn(
-                t.body.location,
+            t.at(t.body).fn(
                 params=[
-                    t.param("x"),
-                    t.param("y", default=t.num(2)),
+                    t.at("x").var("x").param(),
+                    t.at("y").var("y").param(t.at("2").num(2)),
                 ],
-                body=t.var_ref("x", nth=2) + t.var_ref("y", nth=2),
+                body=t.at("x1").var_ref("x") + t.at("y1").var_ref("y"),
             ),
         )
 
     def test_fn_no_params(self):
-        t = FakeDocument("function() 1")
+        t = FakeDocument(
+            dedent(
+                """\
+                function() 1
+                           ^1
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            Fn(t.body.location, [], t.num(1)),
+            t.at(t.body).fn(
+                params=[],
+                body=t.at("1").num(1),
+            ),
         )
 
     def test_import(self):
-        t = FakeDocument("import 'test.jsonnet'")
+        t = FakeDocument(
+            dedent(
+                """\
+                import 'test.jsonnet'
+                       ^............^path
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            Import(
-                location=t.body.location,
-                type="import",
-                path=t.str(
-                    value="test.jsonnet",
-                    literal="'test.jsonnet'",
-                ),
+            t.at(t.body).import_(
+                t.at("path").str("test.jsonnet"),
             ),
         )
 
     def test_importstr(self):
-        t = FakeDocument("importstr 'test.jsonnet'")
+        t = FakeDocument(
+            dedent(
+                """\
+                importstr 'test.jsonnet'
+                          ^............^path
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            Import(
-                location=t.body.location,
-                type="importstr",
-                path=t.str(
-                    value="test.jsonnet",
-                    literal="'test.jsonnet'",
-                ),
+            t.at(t.body).importstr(
+                t.at("path").str("test.jsonnet"),
             ),
         )
 
     def test_assert_expr_without_message(self):
-        t = FakeDocument("assert true; false")
+        t = FakeDocument(
+            dedent(
+                """\
+                assert true; false
+                       ^..^t ^...^f
+                ^.........^a
+                """
+            )
+        )
 
         self.assertAstEqual(
-            t.body,
-            AssertExpr(
-                location=t.body.location,
-                assertion=Assert(
-                    location=t.location_of("assert true"),
-                    condition=t.boolean(True),
-                    message=None,
-                ),
-                body=t.boolean(False),
-            ),
+            t.body, t.at("a").assert_(t.at("t").true).guard(t.at("f").false)
         )
 
     def test_assert_expr_with_message(self):
-        t = FakeDocument("assert true: 'never'; /*!*/ false")
+        t = FakeDocument(
+            dedent(
+                """\
+                assert true: 'never';
+                       ^..^t ^.....^m
+                ^..................^a
+                /* ! */
+                false
+                ^...^f
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            AssertExpr(
-                location=t.body.location,
-                assertion=Assert(
-                    location=t.location_of("assert true: 'never'"),
-                    condition=t.boolean(True),
-                    message=t.str("never", literal="'never'"),
-                ),
-                body=t.boolean(False),
-            ),
+            t.at("a")
+            .assert_(t.at("t").true, t.at("m").str("never"))
+            .guard(t.at("f").false),
         )
 
     def test_assert_expr_in_bind(self):
-        t = FakeDocument("local x = assert true; false; x")
+        t = FakeDocument(
+            dedent(
+                """\
+                local x =
+                      ^x
+                    assert true;
+                    ^.........^a
+                           ^..^t
+                    false;
+                    ^...^f
+                x
+                ^x1
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.body,
-            Local(
-                location=t.body.location,
+            t.at(t.body).local(
                 binds=[
-                    t.var("x").bind(
-                        AssertExpr(
-                            location=t.location_of("assert true; false"),
-                            assertion=Assert(
-                                location=t.location_of("assert true"),
-                                condition=t.boolean(True),
-                            ),
-                            body=t.boolean(False),
-                        )
-                    )
+                    t.at("x")
+                    .var("x")
+                    .bind(t.at("a").assert_(t.at("t").true).guard(t.at("f").false))
                 ],
-                body=t.var_ref("x", nth=2),
+                body=t.at("x1").var_ref("x"),
             ),
         )
 
     def test_nested_assert_expr(self):
         # Assertions are right associated.
-        t = FakeDocument("assert true; assert false; x")
+        t = FakeDocument(
+            dedent(
+                """\
+                assert true; assert false; x
+                ^.........^a1       ^...^f ^x
+                       ^..^t ^..........^a2
+                """
+            )
+        )
+
+        assert1 = t.at("a1").assert_(condition=t.at("t").true)
+        assert2 = t.at("a2").assert_(condition=t.at("f").false)
 
         self.assertAstEqual(
             t.body,
-            AssertExpr(
-                location=t.body.location,
-                assertion=Assert(
-                    location=t.location_of("assert true"),
-                    condition=t.boolean(True),
-                ),
-                body=AssertExpr(
-                    location=t.location_of("assert false; x"),
-                    assertion=Assert(
-                        location=t.location_of("assert false"),
-                        condition=t.boolean(False),
-                    ),
-                    body=t.var_ref("x"),
+            assert1.guard(
+                assert2.guard(
+                    t.at("x").var_ref("x"),
                 ),
             ),
         )
@@ -531,91 +636,137 @@ class TestAST(unittest.TestCase):
     )
 
     def test_object_field_name(self):
-        t = FakeDocument("local x = 'f'; { [x]: 1 }")
-
-        self.assertAstEqual(
-            t.query_one(self.object_query, "field_key"),
-            DynamicKey(
-                t.location_of("[x]"),
-                t.var_ref("x", nth=2),
-            ),
+        t = FakeDocument(
+            dedent(
+                """\
+                local x = 'f';
+                {
+                  [x]: 1
+                   ^var_ref
+                  ^.^key
+                }
+                """
+            )
         )
 
-        t = FakeDocument("{ x: 1 }")
-
         self.assertAstEqual(
             t.query_one(self.object_query, "field_key"),
-            t.field("x"),
+            t.at("key").computed_key(t.at("var_ref").var_ref("x")),
         )
 
-        t = FakeDocument("{ 'x': 1 }")
+        t = FakeDocument(
+            dedent(
+                """\
+                { x: 1 }
+                  ^key
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "field_key"),
-            FixedKey(
-                t.location_of("'x'"),
-                t.str("x", literal="'x'"),
-            ),
+            t.at("key").fixed_id_key("x"),
+        )
+
+        t = FakeDocument(
+            dedent(
+                """\
+                { 'x': 1 }
+                  ^.^key
+                """
+            )
+        )
+
+        self.assertAstEqual(
+            t.query_one(self.object_query, "field_key"),
+            t.at("key").fixed_str_key("x"),
         )
 
     def test_field(self):
-        t = FakeDocument("{ x: 1 }")
+        t = FakeDocument(
+            dedent(
+                """\
+                { x: 1 }
+                  ^key
+                     ^value
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "field"),
-            Field(
-                location=t.location_of("x: 1"),
-                key=t.field("x"),
-                value=t.num(1),
-            ),
+            t.at("key").fixed_id_key("x").with_value(t.at("value").num(1)),
         )
 
     def test_hidden_field(self):
-        t = FakeDocument("{ x+::: 1 }")
+        t = FakeDocument(
+            dedent(
+                """\
+                { x+::: 1 }
+                  ^key  ^value
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "field"),
-            Field(
-                location=t.location_of("x+::: 1"),
-                key=t.field("x"),
-                value=t.num(1),
+            t.at("key")
+            .fixed_id_key("x")
+            .with_value(
+                t.at("value").num(1),
                 visibility=Visibility.Forced,
                 inherited=True,
             ),
         )
 
     def test_function_field(self):
-        t = FakeDocument("{ f(p1, p2 = 0):: p1 + p2 }")
+        t = FakeDocument(
+            dedent(
+                """\
+                { f(p1, p2 = 0):: p1 + p2 }
+                  ^.....................^fn_field
+                  ^key       ^0
+                    ^^p1          ^^ref1
+                        ^^p2           ^^ref2
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "field"),
-            Field(
-                location=t.location_of("f(p1, p2 = 0):: p1 + p2"),
-                key=t.field("f"),
-                value=Fn(
-                    t.location_of("f(p1, p2 = 0):: p1 + p2"),
+            t.at("key")
+            .fixed_id_key("f")
+            .with_value(
+                t.at("fn_field").fn(
                     params=[
-                        t.param("p1"),
-                        t.param("p2", default=t.num(0)),
+                        t.at("p1").var("p1").param(),
+                        t.at("p2").var("p2").param(t.at("0").num(0)),
                     ],
-                    body=t.var_ref("p1", nth=2) + t.var_ref("p2", nth=2),
+                    body=t.at("ref1").var_ref("p1") + t.at("ref2").var_ref("p2"),
                 ),
                 visibility=Visibility.Hidden,
             ),
         )
 
     def test_function_field_no_params(self):
-        t = FakeDocument("{ f():: 1 }")
+        t = FakeDocument(
+            dedent(
+                """\
+                { f():: 1 }
+                  ^.....^field
+                  ^key  ^1
+                """
+            )
+        )
 
         self.assertAstEqual(
             t.query_one(self.object_query, "field"),
-            Field(
-                location=t.location_of("f():: 1"),
-                key=t.field("f"),
-                value=Fn(
-                    t.location_of("f():: 1"),
+            t.at("key")
+            .fixed_id_key("f")
+            .with_value(
+                t.at("field").fn(
                     params=[],
-                    body=t.num(1),
+                    body=t.at("1").num(1),
                 ),
                 visibility=Visibility.Hidden,
             ),
@@ -627,8 +778,20 @@ class TestAST(unittest.TestCase):
                 """\
                 {
                     ['f' + x]: 0
+                               ^0
+                           ^var_ref1
+                     ^.^str
+                    ^.......^field_key
+                    ^..........^field
                     for x in [1, 2]
+                    ^.............^for_spec
+                        ^var ^....^array
+                              ^1
+                                 ^2
                     if x > 1
+                    ^......^if_spec
+                       ^var_ref2
+                           ^num3
                 }
                 """
             )
@@ -640,26 +803,24 @@ class TestAST(unittest.TestCase):
                 location=t.body.location,
                 binds=[],
                 field=Field(
-                    location=t.location_of("['f' + x]: 0", line=2),
-                    key=DynamicKey(
-                        t.location_of("['f' + x]", line=2),
-                        t.str("f", literal="'f'", line=2) + t.var_ref("x", line=2),
+                    location=t.at("field"),
+                    key=ComputedKey(
+                        t.at("field_key"),
+                        t.at("str").str("f") + t.at("var_ref1").var_ref("x"),
                     ),
-                    value=t.num(0, line=2),
+                    value=t.at("0").num(0),
                 ),
-                for_spec=ForSpec(
-                    location=t.location_of("for x in [1, 2]", line=3),
-                    id=t.var("x", line=3),
-                    container=Array(
-                        location=t.location_of("[1, 2]", line=3),
-                        values=[t.num(1, line=3), t.num(2, line=3)],
+                for_spec=t.at("for_spec").for_(
+                    t.at("var").var("x"),
+                    t.at("array").array(
+                        t.at("1").num(1),
+                        t.at("2").num(2),
                     ),
                 ),
                 comp_spec=[
-                    IfSpec(
-                        location=t.location_of("if x > 1", line=4),
-                        condition=t.var_ref("x", line=4) > t.num(1, line=4),
-                    )
+                    t.at("if_spec").if_(
+                        t.at("var_ref2").var_ref("x") > t.at("num3").num(1)
+                    ),
                 ],
             ),
         )
@@ -681,46 +842,62 @@ class TestAST(unittest.TestCase):
         )
 
     def test_narrowest_enclosing_node(self):
-        t = FakeDocument("{ f: local x = 1; x }")
+        t = FakeDocument(
+            dedent(
+                """\
+                {
+                  f: local x = 1;
+                  ^field:    ^eq
+                  ^key         ^num
+                   ^colon  ^var ^semicolon
+                     ^local:
+                  x
+                  ^var_ref
+                  ^:field
+                  ^:local
+                }
+                """
+            )
+        )
 
         def node_at(position: L.Position) -> AST:
             return head(maybe(t.body.node_at(position)))
 
         self.assertAstEqual(
-            node_at(t.start_of("x")),
-            t.id("x", IdKind.Var),
+            node_at(t.at("var").start),
+            t.at("var").var("x"),
         )
 
         self.assertAstEqual(
-            node_at(t.start_of("=")),
-            t.id("x", IdKind.Var).bind(t.num(1)),
+            node_at(t.at("eq").start),
+            t.at("var").var("x").bind(t.at("num").num(1)),
         )
 
         self.assertAstEqual(
-            node_at(t.start_of("local")),
+            node_at(t.at("local").start),
             Local(
-                t.location_of("local x = 1; x"),
-                [t.id("x", IdKind.Var).bind(t.num(1))],
-                t.id("x", IdKind.VarRef, nth=2),
+                t.at("local"),
+                [t.at("var").var("x").bind(t.at("num").num(1))],
+                t.at("var_ref").var_ref("x"),
             ),
         )
 
         local = Local(
-            t.location_of("local x = 1; x"),
-            binds=[t.id("x", IdKind.Var).bind(t.num(1))],
-            body=t.id("x", IdKind.VarRef, nth=2),
+            t.at("local"),
+            binds=[t.at("var").var("x").bind(t.at("num").num(1))],
+            body=t.at("var_ref").var_ref("x"),
         )
 
         self.assertAstEqual(
-            node_at(t.end_of(";")),
+            node_at(t.at("semicolon").end),
             local,
         )
 
         self.assertAstEqual(
-            node_at(t.end_of(":")),
+            node_at(t.at("colon").end),
             Field(
-                t.location_of("f: local x = 1; x"),
-                key=FixedKey(t.location_of("f"), t.id("f", IdKind.Field)),
+                t.at("field"),
+                key=t.at("key").fixed_id_key("f"),
                 value=local,
             ),
         )

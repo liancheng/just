@@ -8,7 +8,7 @@ from joule.ast import (
     Bool,
     Call,
     Document,
-    DynamicKey,
+    ComputedKey,
     Expr,
     Field,
     FieldAccess,
@@ -119,8 +119,8 @@ class Visitor:
             self.visit_arg(a)
 
     def visit_arg(self, a: Arg):
-        if a.id is not None:
-            self.visit(a.id)
+        if a.name is not None:
+            self.visit(a.name)
         self.visit(a.value)
 
     def visit_list_comp(self, e: ListComp):
@@ -165,7 +165,7 @@ class Visitor:
             match f.key:
                 case FixedKey() as key:
                     self.visit(key.id)
-                case DynamicKey() as key:
+                case ComputedKey() as key:
                     self.visit(key.expr)
 
             self.visit_field_key(e, f)
